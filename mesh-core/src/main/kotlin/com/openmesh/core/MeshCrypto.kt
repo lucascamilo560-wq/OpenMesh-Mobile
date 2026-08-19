@@ -38,7 +38,7 @@ object MeshCrypto {
     fun nodeId(publicKeyBase64: String): String {
         val publicBytes = Base64.getDecoder().decode(publicKeyBase64)
         val digest = MessageDigest.getInstance("SHA-256").digest(publicBytes)
-        return "om1-" + digest.copyOfRange(0, 16).joinToString("") { "%02x".format(it) }
+        return MeshNodeId.fromDigest(digest.copyOfRange(0, MeshNodeId.DIGEST_BYTES))
     }
 
     fun seal(
