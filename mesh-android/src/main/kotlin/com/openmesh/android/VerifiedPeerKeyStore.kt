@@ -67,6 +67,16 @@ class VerifiedPeerKeyStore(
     }
 
     @Synchronized
+    fun listVerified(): List<VerifiedPeerMetadata> = preferences.all.keys
+        .asSequence()
+        .filter { it.startsWith(PEER_PREFIX) && it.endsWith(PUBLIC_SUFFIX) }
+        .map { key -> key.removePrefix(PEER_PREFIX).removeSuffix(PUBLIC_SUFFIX) }
+        .distinct()
+        .mapNotNull(::metadata)
+        .sortedByDescending { it.lastVerifiedAtMs }
+        .toList()
+
+    @Synchronized
     fun remove(nodeId: String) {
         check(
             preferences.edit()
@@ -77,12 +87,14 @@ class VerifiedPeerKeyStore(
         ) { "Unable to remove verified OpenMesh peer key" }
     }
 
-    private fun publicKeyKey(nodeId: String) = "peer.$nodeId.public"
-    private fun firstVerifiedKey(nodeId: String) = "peer.$nodeId.firstVerifiedAt"
-    private fun lastVerifiedKey(nodeId: String) = "peer.$nodeId.lastVerifiedAt"
+    private fun publicKeyKey(nodeId: String) = "$PEER_PREFIX$nodeId$PUBLIC_SUFFIX"
+    private fun firstVerifiedKey(nodeId: String) = "$PEER_PREFIX$nodeId.firstVerifiedAt"
+    private fun lastVerifiedKey(nodeId: String) = "$PEER_PREFIX$nodeId.lastVerifiedAt"
 
     companion object {
         private const val DEFAULT_STORE_NAME = "openmesh_verified_peers"
+        private const val PEER_PREFIX = "peer."
+        private const val PUBLIC_SUFFIX = ".public"
     }
 }
 
