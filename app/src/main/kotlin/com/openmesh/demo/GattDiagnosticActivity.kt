@@ -266,8 +266,10 @@ class GattDiagnosticActivity : Activity() {
                         log("OK ${event.packetId.take(8)} → ${shortId(event.peerNodeId)}; frames=${event.frameCount}; final=${event.finalDestination}")
                     }
                     is MeshTransportEvent.SendFailed -> {
-                        val frame = if (event.frameIndex != null && event.frameCount != null) {
-                            "${event.frameIndex + 1}/${event.frameCount}"
+                        val frameIndex = event.frameIndex
+                        val frameCount = event.frameCount
+                        val frame = if (frameIndex != null && frameCount != null) {
+                            "${frameIndex + 1}/$frameCount"
                         } else "-"
                         val failure = "${event.stage} status=${event.status ?: "-"} frame=$frame detail=${event.detail ?: "-"}"
                         outgoing[event.packetId]?.let { view ->
