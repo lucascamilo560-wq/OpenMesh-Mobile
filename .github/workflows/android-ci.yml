@@ -30,4 +30,4 @@ jobs:
           gradle-version: '9.5.0'
 
       - name: Build and test
-        run: gradle :mesh-core:testDebugUnitTest :mesh-android:assembleDebug :app:assembleDebug --stacktrace
+        run: gradle :mesh-core:testDebugUnitTest :mesh-android:testDebugUnitTest :mesh-android:assembleDebug :app:assembleDebug --stacktrace
