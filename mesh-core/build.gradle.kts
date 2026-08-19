@@ -1,19 +1,22 @@
 plugins {
-    kotlin("jvm")
-    id("org.jetbrains.kotlin.plugin.serialization")
+    id("com.android.library")
 }
 
-kotlin {
-    jvmToolchain(17)
+android {
+    namespace = "com.openmesh.core"
+    compileSdk = 36
+
+    defaultConfig {
+        minSdk = 26
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
 }
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
-
-    testImplementation(kotlin("test"))
-}
-
-tasks.test {
-    useJUnitPlatform()
+    testImplementation("junit:junit:4.13.2")
 }
