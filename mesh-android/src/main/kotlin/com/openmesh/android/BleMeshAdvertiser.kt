@@ -19,13 +19,12 @@ class BleMeshAdvertiser(
     @SuppressLint("MissingPermission")
     fun start(nodeId: String, onResult: (AdvertiseState) -> Unit = {}): Boolean {
         if (activeCallback != null) return true
+        if (!MeshNodeId.isValid(nodeId)) {
+            onResult(AdvertiseState.INVALID_NODE_ID)
+            return false
+        }
 
         val advertiser = adapter?.bluetoothLeAdvertiser ?: return false
-        val compactNodeId = runCatching { MeshNodeId.toAdvertisementBytes(nodeId) }
-            .getOrElse {
-                onResult(AdvertiseState.INVALID_NODE_ID)
-                return false
-            }
 
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
@@ -33,13 +32,11 @@ class BleMeshAdvertiser(
             .setConnectable(true)
             .build()
 
+        // Keep legacy advertising below the 31-byte payload limit. Identity is
+        // resolved after discovery through the NODE_ID GATT characteristic.
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(BleMeshProtocol.SERVICE_PARCEL_UUID)
-            .addServiceData(
-                BleMeshProtocol.SERVICE_PARCEL_UUID,
-                compactNodeId,
-            )
             .build()
 
         val callback = object : AdvertiseCallback() {
