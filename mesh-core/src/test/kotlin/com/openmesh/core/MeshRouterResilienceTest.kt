@@ -38,6 +38,10 @@ class MeshRouterResilienceTest {
         assertEquals(1, dToC.size)
         assertEquals(IngestResult.DELIVERED_LOCAL, nodeC.ingest(dToC.single(), nowMs = 3_000))
         assertEquals(2, dToC.single().hopCount)
+
+        // C remembers the packet for deduplication but must never flood its own
+        // final-delivery unicast packet back into the mesh.
+        assertTrue(nodeC.nextBatchForPeer(peerNodeId = "D", nowMs = 4_000).isEmpty())
     }
 
     @Test
