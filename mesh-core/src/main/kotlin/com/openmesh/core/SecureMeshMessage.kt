@@ -59,8 +59,8 @@ object SecureMeshMessage {
         )
         val container = SecureContainer(
             senderPublicKeyBase64 = sender.publicKeyBase64,
-            nonceBase64 = sealed.nonceBase64,
-            ciphertextBase64 = sealed.ciphertextBase64,
+            nonce = Base64.getDecoder().decode(sealed.nonceBase64),
+            ciphertext = Base64.getDecoder().decode(sealed.ciphertextBase64),
         )
         val encodedContainer = SecureContainerCodec.encode(container)
         val signature = MeshCrypto.sign(
@@ -97,7 +97,10 @@ object SecureMeshMessage {
         ) { "Secure envelope signature is invalid" }
 
         val plaintext = MeshCrypto.open(
-            sealed = SealedPayload(container.nonceBase64, container.ciphertextBase64),
+            sealed = SealedPayload(
+                nonceBase64 = Base64.getEncoder().encodeToString(container.nonce),
+                ciphertextBase64 = Base64.getEncoder().encodeToString(container.ciphertext),
+            ),
             receiverPrivateKeyBase64 = recipient.privateKeyBase64,
             senderPublicKeyBase64 = container.senderPublicKeyBase64,
             aad = aad,
@@ -128,8 +131,7 @@ object SecureMeshMessage {
     }
 
     private fun signedBytes(aad: ByteArray, container: SecureContainer): ByteArray =
-        aad + Base64.getDecoder().decode(container.nonceBase64) +
-            Base64.getDecoder().decode(container.ciphertextBase64)
+        aad + container.nonce + container.ciphertext
 }
 
 data class OpenedSecureMessage(
@@ -141,27 +143,41 @@ data class OpenedSecureMessage(
 
 private data class SecureContainer(
     val senderPublicKeyBase64: String,
-    val nonceBase64: String,
-    val ciphertextBase64: String,
+    val nonce: ByteArray,
+    val ciphertext: ByteArray,
 )
 
 private object SecureContainerCodec {
+    private const val MAX_PUBLIC_KEY_BYTES = 4 * 1024
+    private const val MAX_CIPHERTEXT_BYTES = 20 * 1024 * 1024
+
     fun encode(container: SecureContainer): ByteArray {
         val bytes = ByteArrayOutputStream()
         DataOutputStream(bytes).use { out ->
-            out.writeUTF(container.senderPublicKeyBase64)
-            out.writeUTF(container.nonceBase64)
-            out.writeUTF(container.ciphertextBase64)
+            out.writeLengthPrefixed(container.senderPublicKeyBase64.encodeToByteArray())
+            out.writeLengthPrefixed(container.nonce)
+            out.writeLengthPrefixed(container.ciphertext)
         }
         return bytes.toByteArray()
     }
 
     fun decode(bytes: ByteArray): SecureContainer = DataInputStream(ByteArrayInputStream(bytes)).use { input ->
-        SecureContainer(
-            senderPublicKeyBase64 = input.readUTF(),
-            nonceBase64 = input.readUTF(),
-            ciphertextBase64 = input.readUTF(),
-        )
+        val publicKey = input.readLengthPrefixed(MAX_PUBLIC_KEY_BYTES).decodeToString()
+        val nonce = input.readLengthPrefixed(64)
+        val ciphertext = input.readLengthPrefixed(MAX_CIPHERTEXT_BYTES)
+        require(input.available() == 0) { "Unexpected trailing secure-container data" }
+        SecureContainer(publicKey, nonce, ciphertext)
+    }
+
+    private fun DataOutputStream.writeLengthPrefixed(value: ByteArray) {
+        writeInt(value.size)
+        write(value)
+    }
+
+    private fun DataInputStream.readLengthPrefixed(maxBytes: Int): ByteArray {
+        val size = readInt()
+        require(size in 0..maxBytes) { "Invalid secure-container field size: $size" }
+        return ByteArray(size).also(::readFully)
     }
 }
 
@@ -173,6 +189,7 @@ private data class SecureInnerPayload(
 private object SecureInnerPayloadCodec {
     fun encode(contentType: String, payload: ByteArray): ByteArray {
         require(contentType.length <= 8_192) { "Inner content type is too large" }
+        require(payload.size <= MAX_PAYLOAD_BYTES) { "Encrypted payload is too large" }
         val bytes = ByteArrayOutputStream()
         DataOutputStream(bytes).use { out ->
             out.writeUTF(contentType)
@@ -188,6 +205,7 @@ private object SecureInnerPayloadCodec {
         require(size in 0..MAX_PAYLOAD_BYTES) { "Invalid encrypted payload size: $size" }
         val payload = ByteArray(size)
         input.readFully(payload)
+        require(input.available() == 0) { "Unexpected trailing encrypted-payload data" }
         SecureInnerPayload(contentType, payload)
     }
 
