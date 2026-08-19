@@ -15,7 +15,13 @@ import com.openmesh.core.MeshEnvelopeCodec
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** Sends one OpenMesh envelope to one nearby BLE peer. */
+/**
+ * Sends one OpenMesh envelope to one nearby BLE peer.
+ *
+ * For the first real-device transport path we deliberately use the default ATT
+ * MTU (23) instead of immediately negotiating a larger MTU. This creates more
+ * frames but is considerably more conservative across Android BLE stacks.
+ */
 class BleMeshGattClient(
     context: Context,
 ) {
@@ -25,12 +31,16 @@ class BleMeshGattClient(
     suspend fun send(
         deviceAddress: String,
         envelope: MeshEnvelope,
-        timeoutMs: Long = 15_000,
-    ): Boolean {
-        val manager = appContext.getSystemService(BluetoothManager::class.java) ?: return false
-        val adapter = manager.adapter ?: return false
-        val device = runCatching { adapter.getRemoteDevice(deviceAddress) }.getOrNull() ?: return false
-        val completion = CompletableDeferred<Boolean>()
+        timeoutMs: Long = 30_000,
+    ): BleGattSendResult {
+        val manager = appContext.getSystemService(BluetoothManager::class.java)
+            ?: return BleGattSendResult.Failed(BleGattStage.CONNECT, detail = "BluetoothManager unavailable")
+        val adapter = manager.adapter
+            ?: return BleGattSendResult.Failed(BleGattStage.CONNECT, detail = "BluetoothAdapter unavailable")
+        val device = runCatching { adapter.getRemoteDevice(deviceAddress) }.getOrNull()
+            ?: return BleGattSendResult.Failed(BleGattStage.CONNECT, detail = "Invalid/stale device address")
+
+        val completion = CompletableDeferred<BleGattSendResult>()
         val encodedEnvelope = MeshEnvelopeCodec.encode(envelope)
 
         var gatt: BluetoothGatt? = null
@@ -38,28 +48,44 @@ class BleMeshGattClient(
         var frames: List<ByteArray> = emptyList()
         var nextFrameIndex = 0
         var finished = false
+        var stage = BleGattStage.CONNECT
 
-        fun finish(success: Boolean) {
+        fun finish(result: BleGattSendResult) {
             if (finished) return
             finished = true
-            completion.complete(success)
+            completion.complete(result)
         }
 
-        fun prepareFrames(mtu: Int) {
-            val attPayload = (mtu - 3).coerceAtLeast(BleFrameCodec.HEADER_SIZE + 1)
-            frames = BleFrameCodec.chunk(encodedEnvelope, attPayload)
-            nextFrameIndex = 0
+        fun prepareFrames(): Boolean {
+            stage = BleGattStage.PREPARE_FRAMES
+            val attPayload = (DEFAULT_MTU - 3).coerceAtLeast(BleFrameCodec.HEADER_SIZE + 1)
+            return runCatching {
+                frames = BleFrameCodec.chunk(encodedEnvelope, attPayload)
+                nextFrameIndex = 0
+                true
+            }.getOrElse { error ->
+                finish(BleGattSendResult.Failed(stage, detail = error.message))
+                false
+            }
         }
 
         @SuppressLint("MissingPermission")
         fun writeNext(): Boolean {
-            val activeGatt = gatt ?: return false
-            val characteristic = rx ?: return false
+            val activeGatt = gatt ?: run {
+                finish(BleGattSendResult.Failed(BleGattStage.WRITE_FRAME, detail = "GATT handle missing"))
+                return false
+            }
+            val characteristic = rx ?: run {
+                finish(BleGattSendResult.Failed(BleGattStage.WRITE_FRAME, detail = "RX characteristic missing"))
+                return false
+            }
+
             if (nextFrameIndex >= frames.size) {
-                finish(true)
+                finish(BleGattSendResult.Success(frames.size))
                 return true
             }
 
+            stage = BleGattStage.WRITE_FRAME
             val value = frames[nextFrameIndex]
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -75,59 +101,98 @@ class BleMeshGattClient(
                 activeGatt.writeCharacteristic(characteristic)
             }
 
-            if (!accepted) finish(false)
+            if (!accepted) {
+                finish(
+                    BleGattSendResult.Failed(
+                        stage = BleGattStage.WRITE_FRAME,
+                        frameIndex = nextFrameIndex,
+                        frameCount = frames.size,
+                        detail = "writeCharacteristic rejected",
+                    )
+                )
+            }
             return accepted
         }
 
         val callback = object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gattCallback: BluetoothGatt, status: Int, newState: Int) {
+            override fun onConnectionStateChange(activeGatt: BluetoothGatt, status: Int, newState: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    finish(false)
+                    finish(BleGattSendResult.Failed(BleGattStage.CONNECT, status = status))
                     return
                 }
+
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
-                        if (!gattCallback.discoverServices()) finish(false)
+                        stage = BleGattStage.DISCOVER_SERVICES
+                        if (!activeGatt.discoverServices()) {
+                            finish(
+                                BleGattSendResult.Failed(
+                                    stage = BleGattStage.DISCOVER_SERVICES,
+                                    detail = "discoverServices returned false",
+                                )
+                            )
+                        }
                     }
-                    BluetoothProfile.STATE_DISCONNECTED -> if (!finished) finish(false)
+
+                    BluetoothProfile.STATE_DISCONNECTED -> if (!finished) {
+                        finish(
+                            BleGattSendResult.Failed(
+                                stage = stage,
+                                detail = "Disconnected before transfer completed",
+                            )
+                        )
+                    }
                 }
             }
 
-            override fun onServicesDiscovered(gattCallback: BluetoothGatt, status: Int) {
+            override fun onServicesDiscovered(activeGatt: BluetoothGatt, status: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    finish(false)
+                    finish(BleGattSendResult.Failed(BleGattStage.DISCOVER_SERVICES, status = status))
                     return
                 }
-                val service: BluetoothGattService = gattCallback.getService(BleMeshProtocol.SERVICE_UUID)
+
+                stage = BleGattStage.FIND_SERVICE
+                val service: BluetoothGattService = activeGatt.getService(BleMeshProtocol.SERVICE_UUID)
                     ?: run {
-                        finish(false)
+                        finish(
+                            BleGattSendResult.Failed(
+                                stage = BleGattStage.FIND_SERVICE,
+                                detail = "OpenMesh service not found",
+                            )
+                        )
                         return
                     }
+
+                stage = BleGattStage.FIND_RX
                 rx = service.getCharacteristic(BleMeshProtocol.RX_CHARACTERISTIC_UUID)
                     ?: run {
-                        finish(false)
+                        finish(
+                            BleGattSendResult.Failed(
+                                stage = BleGattStage.FIND_RX,
+                                detail = "OpenMesh RX characteristic not found",
+                            )
+                        )
                         return
                     }
 
-                if (!gattCallback.requestMtu(PREFERRED_MTU)) {
-                    prepareFrames(DEFAULT_MTU)
-                    writeNext()
-                }
-            }
-
-            override fun onMtuChanged(gattCallback: BluetoothGatt, mtu: Int, status: Int) {
-                prepareFrames(if (status == BluetoothGatt.GATT_SUCCESS) mtu else DEFAULT_MTU)
-                writeNext()
+                if (prepareFrames()) writeNext()
             }
 
             override fun onCharacteristicWrite(
-                gattCallback: BluetoothGatt,
+                activeGatt: BluetoothGatt,
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
                 if (characteristic.uuid != BleMeshProtocol.RX_CHARACTERISTIC_UUID) return
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    finish(false)
+                    finish(
+                        BleGattSendResult.Failed(
+                            stage = BleGattStage.WRITE_FRAME,
+                            status = status,
+                            frameIndex = nextFrameIndex,
+                            frameCount = frames.size,
+                        )
+                    )
                     return
                 }
                 nextFrameIndex += 1
@@ -135,6 +200,7 @@ class BleMeshGattClient(
             }
         }
 
+        stage = BleGattStage.CONNECT
         gatt = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 device.connectGatt(appContext, false, callback, BluetoothDevice.TRANSPORT_LE)
@@ -142,10 +208,14 @@ class BleMeshGattClient(
                 @Suppress("DEPRECATION")
                 device.connectGatt(appContext, false, callback)
             }
-        }.getOrNull() ?: return false
+        }.getOrNull() ?: return BleGattSendResult.Failed(
+            stage = BleGattStage.CONNECT,
+            detail = "connectGatt threw/returned null",
+        )
 
         return try {
-            withTimeoutOrNull(timeoutMs) { completion.await() } ?: false
+            withTimeoutOrNull(timeoutMs) { completion.await() }
+                ?: BleGattSendResult.Failed(stage = stage, detail = "timeout ${timeoutMs}ms")
         } finally {
             runCatching { gatt?.disconnect() }
             runCatching { gatt?.close() }
@@ -154,6 +224,26 @@ class BleMeshGattClient(
 
     companion object {
         private const val DEFAULT_MTU = 23
-        private const val PREFERRED_MTU = 247
     }
+}
+
+enum class BleGattStage {
+    CONNECT,
+    DISCOVER_SERVICES,
+    FIND_SERVICE,
+    FIND_RX,
+    PREPARE_FRAMES,
+    WRITE_FRAME,
+}
+
+sealed interface BleGattSendResult {
+    data class Success(val frameCount: Int) : BleGattSendResult
+
+    data class Failed(
+        val stage: BleGattStage,
+        val status: Int? = null,
+        val frameIndex: Int? = null,
+        val frameCount: Int? = null,
+        val detail: String? = null,
+    ) : BleGattSendResult
 }
