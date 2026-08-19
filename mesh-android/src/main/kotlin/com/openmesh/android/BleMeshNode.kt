@@ -28,8 +28,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * BLE advertising announces presence. Exact identity is resolved over GATT.
  * Packets are store-and-forward, but a newly queued packet also triggers an
- * immediate flush to every currently known nearby peer. This avoids depending
- * on a future BLE scan callback to move an already queued message.
+ * immediate flush to every currently known nearby peer.
  */
 class BleMeshNode(
     context: Context,
@@ -69,7 +68,6 @@ class BleMeshNode(
             result != IngestResult.REJECTED_EXPIRED &&
             result != IngestResult.REJECTED_PROTOCOL
         ) {
-            // A relay packet may need to continue immediately to another peer.
             scheduleFlushAllKnownPeers(force = true)
         }
     }
@@ -152,7 +150,6 @@ class BleMeshNode(
         return envelope
     }
 
-    /** Returns a peer public key only after private-key possession was verified. */
     fun knownPeerPublicKey(nodeId: String): String? =
         peerPublicKeys[nodeId]
             ?: verifiedPeerKeyStore.getVerifiedPublicKey(nodeId)?.also { key ->
@@ -162,14 +159,8 @@ class BleMeshNode(
     fun verifiedPeerMetadata(nodeId: String): VerifiedPeerMetadata? =
         verifiedPeerKeyStore.metadata(nodeId)
 
-    /** Snapshot of peers that have passed OpenMesh private-key possession verification. */
     fun verifiedPeers(): List<VerifiedPeerMetadata> = verifiedPeerKeyStore.listVerified()
 
-    /**
-     * Queues an E2E encrypted unicast envelope and immediately attempts to move
-     * it to a currently known nearby peer. The durable queue remains the source
-     * of truth if every immediate attempt fails.
-     */
     suspend fun sendSecure(
         payload: ByteArray,
         contentType: String,
@@ -240,6 +231,10 @@ class BleMeshNode(
                     }
 
                     if (identity.nodeId != localNodeId) {
+                        // Some Android BLE stacks need a short gap after the
+                        // identity connection closes before a second GATT client
+                        // connection to the same peripheral is opened.
+                        delay(POST_IDENTITY_GATT_SETTLE_MS)
                         flushResolvedPeer(address, identity)
                     }
                 } finally {
@@ -287,27 +282,36 @@ class BleMeshNode(
         if (batch.isEmpty()) return
 
         for (envelope in batch) {
-            val deliveredToPeer = client.send(address, envelope)
-            if (!deliveredToPeer) {
-                _transportEvents.emit(
-                    MeshTransportEvent.SendFailed(
-                        packetId = envelope.packetId,
-                        peerNodeId = peerNodeId,
+            when (val result = client.send(address, envelope)) {
+                is BleGattSendResult.Failed -> {
+                    _transportEvents.emit(
+                        MeshTransportEvent.SendFailed(
+                            packetId = envelope.packetId,
+                            peerNodeId = peerNodeId,
+                            stage = result.stage,
+                            status = result.status,
+                            frameIndex = result.frameIndex,
+                            frameCount = result.frameCount,
+                            detail = result.detail,
+                        )
                     )
-                )
-                resolvedPeersByAddress.remove(address)
-                addressByNodeId.remove(peerNodeId, address)
-                break
-            }
+                    resolvedPeersByAddress.remove(address)
+                    addressByNodeId.remove(peerNodeId, address)
+                    break
+                }
 
-            known.add(envelope.packetId)
-            _transportEvents.emit(
-                MeshTransportEvent.Forwarded(
-                    packetId = envelope.packetId,
-                    peerNodeId = peerNodeId,
-                    finalDestination = envelope.destinationNodeId == peerNodeId,
-                )
-            )
+                is BleGattSendResult.Success -> {
+                    known.add(envelope.packetId)
+                    _transportEvents.emit(
+                        MeshTransportEvent.Forwarded(
+                            packetId = envelope.packetId,
+                            peerNodeId = peerNodeId,
+                            finalDestination = envelope.destinationNodeId == peerNodeId,
+                            frameCount = result.frameCount,
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -332,8 +336,9 @@ class BleMeshNode(
         private const val MAX_PACKETS_PER_CONTACT = 8
         private const val MAX_KNOWN_PACKETS_PER_PEER = 2_048
         private const val IDENTITY_RETRY_COOLDOWN_MS = 5_000L
-        private const val PASSIVE_FLUSH_DEBOUNCE_MS = 250L
-        private const val RETRY_INTERVAL_MS = 3_000L
+        private const val POST_IDENTITY_GATT_SETTLE_MS = 750L
+        private const val PASSIVE_FLUSH_DEBOUNCE_MS = 350L
+        private const val RETRY_INTERVAL_MS = 4_000L
     }
 }
 
@@ -342,11 +347,17 @@ sealed interface MeshTransportEvent {
         val packetId: String,
         val peerNodeId: String,
         val finalDestination: Boolean,
+        val frameCount: Int,
     ) : MeshTransportEvent
 
     data class SendFailed(
         val packetId: String,
         val peerNodeId: String,
+        val stage: BleGattStage,
+        val status: Int? = null,
+        val frameIndex: Int? = null,
+        val frameCount: Int? = null,
+        val detail: String? = null,
     ) : MeshTransportEvent
 }
 
