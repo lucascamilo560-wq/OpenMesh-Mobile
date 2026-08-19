@@ -8,30 +8,40 @@ import android.bluetooth.BluetoothGattServer
 import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
-import com.openmesh.core.MeshCrypto
 import com.openmesh.core.MeshEnvelope
 import com.openmesh.core.MeshEnvelopeCodec
+import com.openmesh.core.MeshKeyPair
 import com.openmesh.core.MeshNodeId
+import com.openmesh.core.PeerIdentityProof
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
-/** Receives OpenMesh envelopes and exposes compact peer identity over BLE GATT. */
+/** Receives OpenMesh envelopes and exposes self-certifying peer identity over BLE GATT. */
 class BleMeshGattServer(
     context: Context,
     private val localNodeId: String,
-    private val localPublicKeyBase64: String? = null,
+    private val localIdentity: MeshKeyPair? = null,
     private val onEnvelope: suspend (MeshEnvelope) -> Unit,
 ) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val assembler = BleFrameAssembler()
+    private val identityProofByDevice = ConcurrentHashMap<String, ByteArray>()
     private var server: BluetoothGattServer? = null
 
     private val callback = object : BluetoothGattServerCallback() {
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                identityProofByDevice.remove(device.address)
+            }
+        }
+
         override fun onCharacteristicReadRequest(
             device: BluetoothDevice,
             requestId: Int,
@@ -43,7 +53,10 @@ class BleMeshGattServer(
                     runCatching { MeshNodeId.toAdvertisementBytes(localNodeId) }.getOrNull()
 
                 BleMeshProtocol.PUBLIC_KEY_CHARACTERISTIC_UUID ->
-                    localPublicKeyBase64?.encodeToByteArray()
+                    localIdentity?.publicKeyBase64?.encodeToByteArray()
+
+                BleMeshProtocol.IDENTITY_PROOF_CHARACTERISTIC_UUID ->
+                    identityProofByDevice[device.address]
 
                 else -> null
             }
@@ -71,6 +84,30 @@ class BleMeshGattServer(
             offset: Int,
             value: ByteArray,
         ) {
+            if (characteristic.uuid == BleMeshProtocol.IDENTITY_CHALLENGE_CHARACTERISTIC_UUID) {
+                val identity = localIdentity
+                val accepted = identity != null &&
+                    !preparedWrite &&
+                    offset == 0 &&
+                    value.size == PeerIdentityProof.CHALLENGE_BYTES &&
+                    runCatching {
+                        identityProofByDevice[device.address] =
+                            PeerIdentityProof.sign(value, identity).encodeToByteArray()
+                        true
+                    }.getOrDefault(false)
+
+                if (responseNeeded) {
+                    sendResponse(
+                        device,
+                        requestId,
+                        if (accepted) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE,
+                        0,
+                        null,
+                    )
+                }
+                return
+            }
+
             if (characteristic.uuid != BleMeshProtocol.RX_CHARACTERISTIC_UUID || preparedWrite || offset != 0) {
                 if (responseNeeded) {
                     sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, 0, null)
@@ -102,7 +139,7 @@ class BleMeshGattServer(
     fun start(): Boolean {
         if (server != null) return true
         if (!MeshNodeId.isValid(localNodeId)) return false
-        if (localPublicKeyBase64 != null && MeshCrypto.nodeId(localPublicKeyBase64) != localNodeId) return false
+        if (localIdentity != null && localIdentity.nodeId != localNodeId) return false
 
         val manager = appContext.getSystemService(BluetoothManager::class.java) ?: return false
         val opened = runCatching { manager.openGattServer(appContext, callback) }.getOrNull() ?: return false
@@ -117,13 +154,6 @@ class BleMeshGattServer(
             BluetoothGattCharacteristic.PROPERTY_READ,
             BluetoothGattCharacteristic.PERMISSION_READ,
         )
-        val publicKey = localPublicKeyBase64?.let {
-            BluetoothGattCharacteristic(
-                BleMeshProtocol.PUBLIC_KEY_CHARACTERISTIC_UUID,
-                BluetoothGattCharacteristic.PROPERTY_READ,
-                BluetoothGattCharacteristic.PERMISSION_READ,
-            )
-        }
 
         val service = BluetoothGattService(
             BleMeshProtocol.SERVICE_UUID,
@@ -131,7 +161,30 @@ class BleMeshGattServer(
         ).apply {
             addCharacteristic(rx)
             addCharacteristic(nodeId)
-            publicKey?.let(::addCharacteristic)
+
+            if (localIdentity != null) {
+                addCharacteristic(
+                    BluetoothGattCharacteristic(
+                        BleMeshProtocol.PUBLIC_KEY_CHARACTERISTIC_UUID,
+                        BluetoothGattCharacteristic.PROPERTY_READ,
+                        BluetoothGattCharacteristic.PERMISSION_READ,
+                    )
+                )
+                addCharacteristic(
+                    BluetoothGattCharacteristic(
+                        BleMeshProtocol.IDENTITY_CHALLENGE_CHARACTERISTIC_UUID,
+                        BluetoothGattCharacteristic.PROPERTY_WRITE,
+                        BluetoothGattCharacteristic.PERMISSION_WRITE,
+                    )
+                )
+                addCharacteristic(
+                    BluetoothGattCharacteristic(
+                        BleMeshProtocol.IDENTITY_PROOF_CHARACTERISTIC_UUID,
+                        BluetoothGattCharacteristic.PROPERTY_READ,
+                        BluetoothGattCharacteristic.PERMISSION_READ,
+                    )
+                )
+            }
         }
 
         server = opened
@@ -145,6 +198,7 @@ class BleMeshGattServer(
 
     @SuppressLint("MissingPermission")
     fun stop() {
+        identityProofByDevice.clear()
         server?.close()
         server = null
     }
