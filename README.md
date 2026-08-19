@@ -22,7 +22,8 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 - Foreground `connectedDevice` service for active participation.
 - Bluetooth state monitoring: the service pauses transport when Bluetooth is disabled, preserves queued packets, updates the foreground notification and attempts to rejoin automatically after Bluetooth is enabled again.
 - ECDH shared-secret derivation, AES-GCM authenticated encryption and ECDSA signatures in `mesh-core`.
-- Tests covering alternate routing when an intermediate node is offline, duplicate suppression and cryptographic round trips.
+- High-level E2E envelope API that binds immutable routing metadata to encryption/signatures while allowing relay-only hop metadata to change safely.
+- Tests covering alternate routing when an intermediate node is offline, duplicate suppression, anti-echo behavior, cryptographic round trips, relay-safe encrypted delivery and routing-header tamper rejection.
 
 ## Example resilience scenario
 
@@ -51,7 +52,7 @@ The project targets Android API 36 with AGP 9.3, Gradle 9.5 and JDK 17. CI build
 
 ## Security model
 
-Relay nodes should not require plaintext access to application payloads. Encryption and signatures are protocol-level concerns. Key discovery/authentication is intentionally kept separate from transport and is the next security milestone before encrypted direct messaging is exposed as a stable SDK API.
+Relay nodes do not need plaintext access to E2E application payloads. Encryption and signatures are protocol-level concerns. Recipient public keys must already be authenticated by the caller; automatic key discovery/authentication is intentionally a separate milestone and will not be treated as trusted merely because a nearby BLE device advertises a key.
 
 ## License
 
