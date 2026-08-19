@@ -1,9 +1,9 @@
 package com.openmesh.core
 
-import kotlin.test.Test
-import kotlin.test.assertContentEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
 class MeshCryptoTest {
 
@@ -28,7 +28,7 @@ class MeshCryptoTest {
             aad = aad,
         )
 
-        assertContentEquals(plaintext, opened)
+        assertArrayEquals(plaintext, opened)
     }
 
     @Test
