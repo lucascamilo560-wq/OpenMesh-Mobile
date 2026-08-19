@@ -23,8 +23,8 @@ import java.util.UUID
  * Negotiates an optional high-bandwidth Wi-Fi Direct session over OpenMesh BLE.
  *
  * Temporary group credentials are transported inside an end-to-end encrypted
- * envelope, so relay nodes can forward the upgrade offer without learning the
- * Wi-Fi passphrase.
+ * envelope. The resulting TCP session is released to callers only after both
+ * endpoints prove the already-verified OpenMesh identity for that session ID.
  */
 class WifiDirectUpgradeCoordinator(
     context: android.content.Context,
@@ -81,8 +81,27 @@ class WifiDirectUpgradeCoordinator(
             return WifiDirectUpgradeResult.PrepareFailed(prepared)
         }
 
+        val now = System.currentTimeMillis()
+        val offer = WifiDirectUpgradeOffer(
+            sessionId = UUID.randomUUID().toString(),
+            credentials = credentials,
+            expiresAtMs = now + offerTtlMs,
+        )
+
         val hostStarted = dataChannel.host(credentials.port) { session ->
             scope.launch {
+                val authenticated = WifiDirectSessionAuthenticator.authenticate(
+                    session = session,
+                    sessionId = offer.sessionId,
+                    localIdentity = localIdentity,
+                    expectedPeerNodeId = peerNodeId,
+                    expectedPeerPublicKeyBase64 = peerKey,
+                )
+                if (!authenticated) {
+                    session.close()
+                    _events.emit(WifiDirectUpgradeEvent.Failed(peerNodeId, "session-auth"))
+                    return@launch
+                }
                 _sessions.emit(session)
                 _events.emit(WifiDirectUpgradeEvent.SessionOpened(peerNodeId, session.remoteAddress))
             }
@@ -91,13 +110,6 @@ class WifiDirectUpgradeCoordinator(
             groupController.removeGroup()
             return WifiDirectUpgradeResult.DataChannelFailed
         }
-
-        val now = System.currentTimeMillis()
-        val offer = WifiDirectUpgradeOffer(
-            sessionId = UUID.randomUUID().toString(),
-            credentials = credentials,
-            expiresAtMs = now + offerTtlMs,
-        )
 
         val secureEnvelope = runCatching {
             meshNode.sendSecure(
@@ -129,6 +141,12 @@ class WifiDirectUpgradeCoordinator(
     }
 
     private suspend fun acceptOffer(senderNodeId: String, offer: WifiDirectUpgradeOffer) {
+        val senderKey = meshNode.knownPeerPublicKey(senderNodeId)
+        if (senderKey == null) {
+            _events.emit(WifiDirectUpgradeEvent.Failed(senderNodeId, "peer-key-unavailable"))
+            return
+        }
+
         when (val connected = groupController.joinGroup(offer.credentials, remainingMs(offer))) {
             is WifiDirectGroupResult.Connected -> {
                 if (connected.isGroupOwner) {
@@ -143,6 +161,20 @@ class WifiDirectUpgradeCoordinator(
                     _events.emit(WifiDirectUpgradeEvent.Failed(senderNodeId, "tcp-connect"))
                     return
                 }
+
+                val authenticated = WifiDirectSessionAuthenticator.authenticate(
+                    session = session,
+                    sessionId = offer.sessionId,
+                    localIdentity = localIdentity,
+                    expectedPeerNodeId = senderNodeId,
+                    expectedPeerPublicKeyBase64 = senderKey,
+                )
+                if (!authenticated) {
+                    session.close()
+                    _events.emit(WifiDirectUpgradeEvent.Failed(senderNodeId, "session-auth"))
+                    return
+                }
+
                 _sessions.emit(session)
                 _events.emit(WifiDirectUpgradeEvent.SessionOpened(senderNodeId, session.remoteAddress))
             }
