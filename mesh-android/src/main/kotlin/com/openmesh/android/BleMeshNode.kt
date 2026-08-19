@@ -4,9 +4,11 @@ import android.content.Context
 import android.util.Base64
 import com.openmesh.core.IngestResult
 import com.openmesh.core.MeshEnvelope
+import com.openmesh.core.MeshKeyPair
 import com.openmesh.core.MeshRouter
 import com.openmesh.core.PacketPriority
 import com.openmesh.core.PacketStore
+import com.openmesh.core.SecureMeshMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -98,6 +100,36 @@ class BleMeshNode(
             priority = priority,
             contentType = contentType,
             payloadBase64 = Base64.encodeToString(payload, Base64.NO_WRAP),
+        )
+        router.createLocal(envelope)
+        return envelope
+    }
+
+    /**
+     * Queues an E2E encrypted unicast envelope. The caller must already possess
+     * an authenticated recipient public key; nearby advertisements are not
+     * automatically trusted as identity proof.
+     */
+    suspend fun sendSecure(
+        payload: ByteArray,
+        contentType: String,
+        senderIdentity: MeshKeyPair,
+        recipientNodeId: String,
+        recipientPublicKeyBase64: String,
+        ttlMs: Long = DEFAULT_TTL_MS,
+        priority: PacketPriority = PacketPriority.NORMAL,
+    ): MeshEnvelope {
+        require(senderIdentity.nodeId == localNodeId) {
+            "Sender identity does not match this OpenMesh node"
+        }
+        val envelope = SecureMeshMessage.create(
+            plaintext = payload,
+            innerContentType = contentType,
+            sender = senderIdentity,
+            recipientNodeId = recipientNodeId,
+            recipientPublicKeyBase64 = recipientPublicKeyBase64,
+            ttlMs = ttlMs,
+            priority = priority,
         )
         router.createLocal(envelope)
         return envelope
