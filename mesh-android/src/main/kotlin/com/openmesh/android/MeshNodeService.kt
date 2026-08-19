@@ -113,7 +113,7 @@ class MeshNodeService : Service() {
             }
 
             else -> {
-                val activeNode = node ?: BleMeshNode(applicationContext, currentNodeId).also {
+                val activeNode = node ?: createNode(currentNodeId).also {
                     node = it
                 }
                 when (val result = activeNode.start()) {
@@ -131,6 +131,20 @@ class MeshNodeService : Service() {
                 }
             }
         }
+    }
+
+    private fun createNode(currentNodeId: String): BleMeshNode {
+        // Default integrations can expose their public key automatically. Hosts
+        // using a custom identity may still create BleMeshNode directly.
+        val identity = runCatching { AndroidMeshIdentityStore(applicationContext).loadOrCreate() }
+            .getOrNull()
+            ?.takeIf { it.nodeId == currentNodeId }
+
+        return BleMeshNode(
+            context = applicationContext,
+            localNodeId = currentNodeId,
+            localIdentity = identity,
+        )
     }
 
     private fun pauseForRadioOff() {
