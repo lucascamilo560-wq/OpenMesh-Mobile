@@ -25,7 +25,7 @@ class MeshRouterResilienceTest {
             nowMs = 1_000,
         )
 
-        assertEquals(IngestResult.STORED_FOR_FORWARDING, nodeA.createLocal(packet))
+        assertEquals(IngestResult.STORED_FOR_FORWARDING, nodeA.createLocal(packet, nowMs = 1_000))
         assertTrue(storeA.contains(packet.packetId))
 
         // B never participates. Later A encounters D instead.
