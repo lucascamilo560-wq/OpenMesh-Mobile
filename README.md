@@ -7,7 +7,7 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 ## Current architecture
 
 - `mesh-core`: protocol envelope, TTL/hop rules, deduplication, store-and-forward router and cryptographic primitives. The code is transport-neutral; it is currently packaged as an Android library so every module can use AGP 9.3 built-in Kotlin consistently.
-- `mesh-android`: radio permission supervision, BLE advertising/scanning, GATT sender/receiver, persistent packet storage and foreground node service.
+- `mesh-android`: radio permission supervision, BLE advertising/scanning, GATT sender/receiver, persistent packet storage, protected device identity and foreground node service.
 - `app`: dependency-light Android demo used to test two or more physical phones.
 
 ## Implemented
@@ -21,6 +21,8 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 - `MeshRadioGuard` for missing permissions, Bluetooth state and radio capability.
 - Foreground `connectedDevice` service for active participation.
 - Bluetooth state monitoring: the service pauses transport when Bluetooth is disabled, preserves queued packets, updates the foreground notification and attempts to rejoin automatically after Bluetooth is enabled again.
+- EC device identity whose `nodeId` is derived from its public key.
+- Android identity persistence with the exported EC private material encrypted by a non-exportable AES key in Android Keystore.
 - ECDH shared-secret derivation, AES-GCM authenticated encryption and ECDSA signatures in `mesh-core`.
 - High-level E2E envelope API that binds immutable routing metadata to encryption/signatures while allowing relay-only hop metadata to change safely.
 - Tests covering alternate routing when an intermediate node is offline, duplicate suppression, anti-echo behavior, cryptographic round trips, relay-safe encrypted delivery and routing-header tamper rejection.
