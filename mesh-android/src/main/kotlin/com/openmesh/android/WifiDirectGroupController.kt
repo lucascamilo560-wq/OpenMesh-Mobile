@@ -11,6 +11,7 @@ import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Looper
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.security.SecureRandom
@@ -21,8 +22,8 @@ import kotlin.coroutines.resume
  * High-bandwidth upgrade controller for Android 10+.
  *
  * OpenMesh exchanges [WifiDirectCredentials] over an authenticated BLE control
- * envelope. The group owner can therefore prepare its group first, send the
- * temporary credentials, and only then wait for the peer to join.
+ * envelope. A group owner is considered connected only when at least one real
+ * P2P client has joined; merely creating the local group is not a connection.
  */
 class WifiDirectGroupController(
     context: Context,
@@ -42,18 +43,40 @@ class WifiDirectGroupController(
         val readiness = WifiDirectRadioGuard(appContext).snapshot()
         if (!readiness.ready) return WifiDirectPrepareResult.NotReady(readiness)
 
-        val config = config(credentials)
-        return suspendCancellableCoroutine { continuation ->
-            manager!!.createGroup(channel!!, config, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    if (continuation.isActive) continuation.resume(WifiDirectPrepareResult.Ready(credentials))
-                }
+        // Clear any stale group left by a cancelled/previous test. Some Android
+        // implementations otherwise answer createGroup() with BUSY indefinitely.
+        removeGroupAndAwait()
+        delay(INITIAL_RADIO_SETTLE_MS)
 
-                override fun onFailure(reason: Int) {
-                    if (continuation.isActive) continuation.resume(WifiDirectPrepareResult.Failed(reason))
+        var lastReason = WifiP2pManager.ERROR
+        repeat(MAX_BUSY_ATTEMPTS) { attempt ->
+            when (val result = createGroupOnce(credentials)) {
+                is WifiDirectPrepareResult.Ready -> return result
+                WifiDirectPrepareResult.Unsupported -> return result
+                is WifiDirectPrepareResult.NotReady -> return result
+                is WifiDirectPrepareResult.Failed -> {
+                    lastReason = result.reason
+                    if (result.reason != WifiP2pManager.BUSY) return result
+                    removeGroupAndAwait()
+                    delay(BUSY_BACKOFF_MS * (attempt + 1L))
                 }
-            })
+            }
         }
+        return WifiDirectPrepareResult.Failed(lastReason)
+    }
+
+    private suspend fun createGroupOnce(
+        credentials: WifiDirectCredentials,
+    ): WifiDirectPrepareResult = suspendCancellableCoroutine { continuation ->
+        manager!!.createGroup(channel!!, config(credentials), object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                if (continuation.isActive) continuation.resume(WifiDirectPrepareResult.Ready(credentials))
+            }
+
+            override fun onFailure(reason: Int) {
+                if (continuation.isActive) continuation.resume(WifiDirectPrepareResult.Failed(reason))
+            }
+        })
     }
 
     suspend fun createGroup(
@@ -77,11 +100,32 @@ class WifiDirectGroupController(
         val readiness = WifiDirectRadioGuard(appContext).snapshot()
         if (!readiness.ready) return WifiDirectGroupResult.NotReady(readiness)
 
+        var lastFailure: WifiDirectGroupResult = WifiDirectGroupResult.Failed(WifiP2pManager.ERROR)
+        repeat(MAX_BUSY_ATTEMPTS) { attempt ->
+            val result = joinGroupOnce(credentials, timeoutMs)
+            if (result !is WifiDirectGroupResult.Failed || result.reason != WifiP2pManager.BUSY) {
+                return result
+            }
+            lastFailure = result
+            removeGroupAndAwait()
+            delay(BUSY_BACKOFF_MS * (attempt + 1L))
+        }
+        return lastFailure
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun joinGroupOnce(
+        credentials: WifiDirectCredentials,
+        timeoutMs: Long,
+    ): WifiDirectGroupResult {
         val connection = CompletableDeferred<WifiDirectGroupResult>()
         val receiver = registerConnectionReceiver(connection, credentials)
 
         manager!!.connect(channel!!, config(credentials), object : WifiP2pManager.ActionListener {
-            override fun onSuccess() = Unit
+            override fun onSuccess() {
+                requestCurrentConnection(connection, credentials)
+            }
+
             override fun onFailure(reason: Int) {
                 connection.complete(WifiDirectGroupResult.Failed(reason))
             }
@@ -118,6 +162,26 @@ class WifiDirectGroupController(
         localManager.removeGroup(localChannel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() = onComplete(true)
             override fun onFailure(reason: Int) = onComplete(false)
+        })
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun removeGroupAndAwait(): Boolean = suspendCancellableCoroutine { continuation ->
+        val localManager = manager
+        val localChannel = channel
+        if (localManager == null || localChannel == null) {
+            continuation.resume(false)
+            return@suspendCancellableCoroutine
+        }
+        localManager.removeGroup(localChannel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                if (continuation.isActive) continuation.resume(true)
+            }
+
+            override fun onFailure(reason: Int) {
+                // No existing group is not fatal; caller wants a clean slate.
+                if (continuation.isActive) continuation.resume(false)
+            }
         })
     }
 
@@ -167,6 +231,7 @@ class WifiDirectGroupController(
         return receiver
     }
 
+    @SuppressLint("MissingPermission")
     private fun completeFromInfo(
         completion: CompletableDeferred<WifiDirectGroupResult>,
         credentials: WifiDirectCredentials,
@@ -174,13 +239,33 @@ class WifiDirectGroupController(
     ) {
         if (info?.groupFormed != true || completion.isCompleted) return
         val owner = info.groupOwnerAddress?.hostAddress ?: return
-        completion.complete(
-            WifiDirectGroupResult.Connected(
-                credentials = credentials,
-                groupOwnerAddress = owner,
-                isGroupOwner = info.isGroupOwner,
+
+        if (!info.isGroupOwner) {
+            completion.complete(
+                WifiDirectGroupResult.Connected(
+                    credentials = credentials,
+                    groupOwnerAddress = owner,
+                    isGroupOwner = false,
+                )
             )
-        )
+            return
+        }
+
+        // The owner has a local group immediately after createGroup(). Do not
+        // report success until Android confirms a real client is in that group.
+        val localManager = manager ?: return
+        val localChannel = channel ?: return
+        localManager.requestGroupInfo(localChannel) { group ->
+            if (completion.isCompleted) return@requestGroupInfo
+            if (group?.clientList?.isEmpty() != false) return@requestGroupInfo
+            completion.complete(
+                WifiDirectGroupResult.Connected(
+                    credentials = credentials,
+                    groupOwnerAddress = owner,
+                    isGroupOwner = true,
+                )
+            )
+        }
     }
 
     private fun unregisterReceiver(receiver: BroadcastReceiver) {
@@ -189,6 +274,9 @@ class WifiDirectGroupController(
 
     companion object {
         private const val DEFAULT_TIMEOUT_MS = 25_000L
+        private const val MAX_BUSY_ATTEMPTS = 3
+        private const val INITIAL_RADIO_SETTLE_MS = 350L
+        private const val BUSY_BACKOFF_MS = 600L
     }
 }
 
