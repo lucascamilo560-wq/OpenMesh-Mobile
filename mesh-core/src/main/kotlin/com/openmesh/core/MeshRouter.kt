@@ -36,6 +36,8 @@ class MeshRouter(
             _deliveries.emit(packet)
         }
 
+        // Keep a record even after final delivery so duplicates are suppressed.
+        // nextBatchForPeer() prevents final-destination packets from being re-forwarded.
         if (packet.canForward(nowMs)) {
             store.put(packet)
         }
@@ -58,6 +60,7 @@ class MeshRouter(
         return store.list()
             .asSequence()
             .filter { it.canForward(nowMs) }
+            .filter { it.destinationNodeId != localNodeId }
             .filter { it.packetId !in peerKnownPacketIds }
             .filter { it.lastHopNodeId != peerNodeId }
             .sortedWith(
