@@ -11,6 +11,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -33,7 +34,7 @@ class WifiDirectUpgradeCoordinator(
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val groupController = WifiDirectGroupController(appContext)
-    private val dataChannel = WifiDirectDataChannel(scope)
+    private val dataChannel = WifiDirectDataChannel()
     private var deliveryJob: Job? = null
 
     private val _sessions = MutableSharedFlow<WifiDirectSocketSession>(extraBufferCapacity = 8)
