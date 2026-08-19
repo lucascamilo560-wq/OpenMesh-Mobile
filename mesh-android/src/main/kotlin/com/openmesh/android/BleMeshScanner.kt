@@ -7,7 +7,6 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
-import com.openmesh.core.MeshNodeId
 
 class BleMeshScanner(
     private val context: Context,
@@ -53,18 +52,9 @@ class BleMeshScanner(
 
     @SuppressLint("MissingPermission")
     private fun publish(result: ScanResult, onPeer: (PeerAdvertisement) -> Unit) {
-        val compactNodeId = result.scanRecord
-            ?.getServiceData(BleMeshProtocol.SERVICE_PARCEL_UUID)
-            ?: return
-        if (compactNodeId.size != MeshNodeId.DIGEST_BYTES) return
-
-        val nodeId = runCatching { MeshNodeId.fromAdvertisementBytes(compactNodeId) }
-            .getOrNull() ?: return
-
         onPeer(
             PeerAdvertisement(
                 deviceAddress = result.device.address,
-                nodeId = nodeId,
                 rssi = result.rssi,
                 seenAtMs = System.currentTimeMillis(),
             )
@@ -74,7 +64,6 @@ class BleMeshScanner(
 
 data class PeerAdvertisement(
     val deviceAddress: String,
-    val nodeId: String,
     val rssi: Int,
     val seenAtMs: Long,
 )
