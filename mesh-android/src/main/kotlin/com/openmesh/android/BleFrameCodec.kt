@@ -1,5 +1,6 @@
 package com.openmesh.android
 
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
@@ -11,11 +12,12 @@ import java.util.concurrent.ConcurrentHashMap
 object BleFrameCodec {
     const val VERSION: Byte = 1
     const val HEADER_SIZE = 13
+    private val random = SecureRandom()
 
     fun chunk(
         payload: ByteArray,
         maxFrameBytes: Int,
-        transferId: Long = SecureRandom().nextLong(),
+        transferId: Long = random.nextLong(),
     ): List<ByteArray> {
         require(maxFrameBytes > HEADER_SIZE) { "BLE frame must leave room for payload" }
         val payloadPerFrame = maxFrameBytes - HEADER_SIZE
@@ -83,17 +85,18 @@ class BleFrameAssembler(
             }
         } ?: return null
 
-        assembly.chunks[frame.index] = frame.payload
-        if (assembly.chunks.size != assembly.total) return null
+        synchronized(assembly) {
+            assembly.chunks[frame.index] = frame.payload
+            if (assembly.chunks.size != assembly.total) return null
 
-        val completed = buildList {
+            val output = ByteArrayOutputStream()
             for (index in 0 until assembly.total) {
-                add(assembly.chunks[index] ?: return null)
+                val chunk = assembly.chunks[index] ?: return null
+                output.write(chunk)
             }
-        }.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
-
-        assemblies.remove(frame.transferId)
-        return completed
+            assemblies.remove(frame.transferId)
+            return output.toByteArray()
+        }
     }
 
     fun purgeStale(nowMs: Long = System.currentTimeMillis()) {
