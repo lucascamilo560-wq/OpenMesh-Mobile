@@ -7,7 +7,7 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 ## Current architecture
 
 - `mesh-core`: protocol envelope, canonical cryptographic node IDs, TTL/hop rules, deduplication, store-and-forward router, E2E encryption and peer identity proof primitives.
-- `mesh-android`: radio permission supervision, compact BLE advertising/scanning, GATT identity resolution/challenge-response and packet transport, persistent packet storage, protected device identity and foreground node service.
+- `mesh-android`: radio permission supervision, compact BLE advertising/scanning, GATT identity resolution/challenge-response and packet transport, persistent packet/key storage, protected device identity and foreground node service.
 - `app`: dependency-light Android demo used to test two or more physical phones.
 
 ## Implemented
@@ -15,8 +15,10 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 - BLE presence discovery and connectable advertising that stays within the legacy 31-byte advertising budget by publishing only the OpenMesh service UUID.
 - Exact peer identity resolution after discovery through a compact 16-byte GATT node-ID characteristic; the receiver reconstructs the same `om1-...` ID used by routing.
 - GATT public-key discovery bound to the self-certifying node ID.
-- Fresh 32-byte challenge-response proof of private-key possession before a discovered public key is admitted to the trusted peer-key cache.
-- Unverified peers may still relay packets, but their public keys are not exposed as trusted keys for E2E messaging.
+- Fresh 32-byte challenge-response proof of private-key possession before a discovered public key is admitted to the verified peer-key cache.
+- Verified peer keys are persisted locally with first/last verification metadata and reused after app/device restarts.
+- A conflicting public key for the same self-certifying `nodeId` is rejected instead of silently replacing the stored key.
+- Unverified peers may still relay packets, but their public keys are not exposed as verified keys for E2E messaging.
 - GATT packet transport with fragmentation/reassembly for MTU-sized frames.
 - Store-and-forward routing with TTL, hop limit and priority.
 - Durable Android packet queue that survives process/device restarts.
@@ -52,14 +54,14 @@ The project targets Android API 36 with AGP 9.3, Gradle 9.5 and JDK 17. CI build
 
 ## Next protocol work
 
-- Persistent verified peer-key/contact directory with trust state and key-change handling.
-- Delivery acknowledgements and persistent peer-known packet summaries.
+- Persistent delivery acknowledgements and peer-known packet summaries to reduce redundant flooding across restarts.
+- User/contact trust layer above the cryptographic device verification layer.
 - Wi-Fi Direct / Wi-Fi Aware high-bandwidth transport.
 - Capacitor bridge/SDK packaging for future integration into other apps.
 
 ## Security model
 
-Relay nodes do not need plaintext access to E2E application payloads. Encryption and signatures are protocol-level concerns. A discovered public key must hash to the resolved self-certifying `nodeId` and successfully sign a fresh challenge before the Android SDK caches it as a verified peer key. Human/contact-level trust remains a separate application concern; proximity alone does not establish identity ownership.
+Relay nodes do not need plaintext access to E2E application payloads. Encryption and signatures are protocol-level concerns. A discovered public key must hash to the resolved self-certifying `nodeId` and successfully sign a fresh challenge before the Android SDK persists it as a verified peer key. Human/contact-level trust remains a separate application concern; proximity alone does not establish identity ownership.
 
 ## License
 
