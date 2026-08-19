@@ -15,17 +15,21 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Android-first OpenMesh node.
  *
- * BLE advertising only announces presence. After discovery, the exact routable
- * node ID is resolved from GATT before any packet is forwarded. Public keys are
- * exposed to callers only after the peer proves possession of the matching
- * private key with a fresh signed challenge.
+ * BLE advertising announces presence. Exact identity is resolved over GATT.
+ * Packets are store-and-forward, but a newly queued packet also triggers an
+ * immediate flush to every currently known nearby peer. This avoids depending
+ * on a future BLE scan callback to move an already queued message.
  */
 class BleMeshNode(
     context: Context,
@@ -42,18 +46,32 @@ class BleMeshNode(
     private val client = BleMeshGattClient(appContext)
     private val verifiedPeerKeyStore = VerifiedPeerKeyStore(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val activePeerJobs = ConcurrentHashMap<String, Job>()
-    private val lastPeerSyncAt = ConcurrentHashMap<String, Long>()
+    private val lastIdentityAttemptAt = ConcurrentHashMap<String, Long>()
     private val peerKnownPacketIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val resolvedPeersByAddress = ConcurrentHashMap<String, ResolvedPeerIdentity>()
+    private val addressByNodeId = ConcurrentHashMap<String, String>()
     private val peerPublicKeys = ConcurrentHashMap<String, String>()
+    private var retryJob: Job? = null
+
+    private val _transportEvents = MutableSharedFlow<MeshTransportEvent>(extraBufferCapacity = 128)
+    val transportEvents: SharedFlow<MeshTransportEvent> = _transportEvents.asSharedFlow()
 
     private val server = BleMeshGattServer(
         context = appContext,
         localNodeId = localNodeId,
         localIdentity = localIdentity,
     ) { envelope ->
-        router.ingest(envelope)
+        val result = router.ingest(envelope)
+        if (
+            result != IngestResult.DUPLICATE &&
+            result != IngestResult.REJECTED_EXPIRED &&
+            result != IngestResult.REJECTED_PROTOCOL
+        ) {
+            // A relay packet may need to continue immediately to another peer.
+            scheduleFlushAllKnownPeers(force = true)
+        }
     }
 
     init {
@@ -87,10 +105,14 @@ class BleMeshNode(
             server.stop()
             return MeshNodeStartResult.TransportFailure("ble-scanner")
         }
+
+        startRetryLoop()
         return MeshNodeStartResult.Started
     }
 
     fun stop() {
+        retryJob?.cancel()
+        retryJob = null
         scanner.stop()
         advertiser.stop()
         server.stop()
@@ -104,7 +126,11 @@ class BleMeshNode(
         scope.cancel()
     }
 
-    suspend fun queue(envelope: MeshEnvelope): IngestResult = router.createLocal(envelope)
+    suspend fun queue(envelope: MeshEnvelope): IngestResult {
+        val result = router.createLocal(envelope)
+        scheduleFlushAllKnownPeers(force = true)
+        return result
+    }
 
     suspend fun send(
         payload: ByteArray,
@@ -122,6 +148,7 @@ class BleMeshNode(
             payloadBase64 = Base64.encodeToString(payload, Base64.NO_WRAP),
         )
         router.createLocal(envelope)
+        scheduleFlushAllKnownPeers(force = true)
         return envelope
     }
 
@@ -139,9 +166,9 @@ class BleMeshNode(
     fun verifiedPeers(): List<VerifiedPeerMetadata> = verifiedPeerKeyStore.listVerified()
 
     /**
-     * Queues an E2E encrypted unicast envelope. The caller must already possess
-     * an authenticated recipient public key; nearby advertisements alone are not
-     * treated as identity proof.
+     * Queues an E2E encrypted unicast envelope and immediately attempts to move
+     * it to a currently known nearby peer. The durable queue remains the source
+     * of truth if every immediate attempt fails.
      */
     suspend fun sendSecure(
         payload: ByteArray,
@@ -165,59 +192,55 @@ class BleMeshNode(
             priority = priority,
         )
         router.createLocal(envelope)
+
+        val directAddress = addressByNodeId[recipientNodeId]
+        if (directAddress != null) {
+            scheduleFlushAddress(directAddress, force = true)
+        } else {
+            scheduleFlushAllKnownPeers(force = true)
+        }
         return envelope
     }
 
     private fun onPeerSeen(peer: PeerAdvertisement) {
         val address = peer.deviceAddress
-        val now = System.currentTimeMillis()
-        val previous = lastPeerSyncAt[address] ?: 0L
-        if (now - previous < PEER_SYNC_COOLDOWN_MS) return
-        lastPeerSyncAt[address] = now
+        val cached = resolvedPeersByAddress[address]
+        if (cached != null) {
+            addressByNodeId[cached.nodeId] = address
+            scheduleFlushAddress(address, force = false)
+            return
+        }
 
+        val now = System.currentTimeMillis()
+        val previous = lastIdentityAttemptAt[address] ?: 0L
+        if (now - previous < IDENTITY_RETRY_COOLDOWN_MS) return
+        lastIdentityAttemptAt[address] = now
+        scheduleResolveAndFlush(address)
+    }
+
+    private fun scheduleResolveAndFlush(address: String) {
         activePeerJobs.compute(address) { _, existing ->
             if (existing?.isActive == true) return@compute existing
             scope.launch {
                 try {
-                    val resolved = resolvedPeersByAddress[address]
-                        ?: identityClient.resolve(address)?.also { identity ->
-                            resolvedPeersByAddress[address] = identity
-                            if (identity.possessionVerified) {
-                                identity.publicKeyBase64?.let { key ->
-                                    val persisted = runCatching {
-                                        verifiedPeerKeyStore.putVerified(
-                                            nodeId = identity.nodeId,
-                                            publicKeyBase64 = key,
-                                        )
-                                    }.isSuccess
-                                    if (persisted) {
-                                        peerPublicKeys[identity.nodeId] = key
-                                    }
-                                }
-                            }
+                    val identity = identityClient.resolve(address) ?: return@launch
+                    resolvedPeersByAddress[address] = identity
+                    addressByNodeId[identity.nodeId] = address
+
+                    if (identity.possessionVerified) {
+                        identity.publicKeyBase64?.let { key ->
+                            val persisted = runCatching {
+                                verifiedPeerKeyStore.putVerified(
+                                    nodeId = identity.nodeId,
+                                    publicKeyBase64 = key,
+                                )
+                            }.isSuccess
+                            if (persisted) peerPublicKeys[identity.nodeId] = key
                         }
-                        ?: return@launch
-
-                    val peerNodeId = resolved.nodeId
-                    if (peerNodeId == localNodeId) return@launch
-
-                    val known = peerKnownPacketIds.computeIfAbsent(peerNodeId) {
-                        ConcurrentHashMap.newKeySet<String>()
                     }
-                    if (known.size > MAX_KNOWN_PACKETS_PER_PEER) known.clear()
 
-                    val batch = router.nextBatchForPeer(
-                        peerNodeId = peerNodeId,
-                        peerKnownPacketIds = known,
-                        limit = MAX_PACKETS_PER_CONTACT,
-                    )
-                    for (envelope in batch) {
-                        val deliveredToPeer = client.send(address, envelope)
-                        if (!deliveredToPeer) {
-                            resolvedPeersByAddress.remove(address)
-                            break
-                        }
-                        known.add(envelope.packetId)
+                    if (identity.nodeId != localNodeId) {
+                        flushResolvedPeer(address, identity)
                     }
                 } finally {
                     activePeerJobs.remove(address)
@@ -226,12 +249,105 @@ class BleMeshNode(
         }
     }
 
+    private fun scheduleFlushAddress(address: String, force: Boolean) {
+        val resolved = resolvedPeersByAddress[address] ?: run {
+            scheduleResolveAndFlush(address)
+            return
+        }
+        if (resolved.nodeId == localNodeId) return
+
+        activePeerJobs.compute(address) { _, existing ->
+            if (existing?.isActive == true) return@compute existing
+            scope.launch {
+                try {
+                    if (!force) delay(PASSIVE_FLUSH_DEBOUNCE_MS)
+                    flushResolvedPeer(address, resolved)
+                } finally {
+                    activePeerJobs.remove(address)
+                }
+            }
+        }
+    }
+
+    private suspend fun flushResolvedPeer(
+        address: String,
+        resolved: ResolvedPeerIdentity,
+    ) {
+        val peerNodeId = resolved.nodeId
+        val known = peerKnownPacketIds.computeIfAbsent(peerNodeId) {
+            ConcurrentHashMap.newKeySet<String>()
+        }
+        if (known.size > MAX_KNOWN_PACKETS_PER_PEER) known.clear()
+
+        val batch = router.nextBatchForPeer(
+            peerNodeId = peerNodeId,
+            peerKnownPacketIds = known,
+            limit = MAX_PACKETS_PER_CONTACT,
+        )
+        if (batch.isEmpty()) return
+
+        for (envelope in batch) {
+            val deliveredToPeer = client.send(address, envelope)
+            if (!deliveredToPeer) {
+                _transportEvents.emit(
+                    MeshTransportEvent.SendFailed(
+                        packetId = envelope.packetId,
+                        peerNodeId = peerNodeId,
+                    )
+                )
+                resolvedPeersByAddress.remove(address)
+                addressByNodeId.remove(peerNodeId, address)
+                break
+            }
+
+            known.add(envelope.packetId)
+            _transportEvents.emit(
+                MeshTransportEvent.Forwarded(
+                    packetId = envelope.packetId,
+                    peerNodeId = peerNodeId,
+                    finalDestination = envelope.destinationNodeId == peerNodeId,
+                )
+            )
+        }
+    }
+
+    private fun scheduleFlushAllKnownPeers(force: Boolean) {
+        resolvedPeersByAddress.keys.forEach { address ->
+            scheduleFlushAddress(address, force)
+        }
+    }
+
+    private fun startRetryLoop() {
+        if (retryJob?.isActive == true) return
+        retryJob = scope.launch {
+            while (isActive) {
+                delay(RETRY_INTERVAL_MS)
+                scheduleFlushAllKnownPeers(force = true)
+            }
+        }
+    }
+
     companion object {
         const val DEFAULT_TTL_MS = 72L * 60L * 60L * 1000L
         private const val MAX_PACKETS_PER_CONTACT = 8
         private const val MAX_KNOWN_PACKETS_PER_PEER = 2_048
-        private const val PEER_SYNC_COOLDOWN_MS = 15_000L
+        private const val IDENTITY_RETRY_COOLDOWN_MS = 5_000L
+        private const val PASSIVE_FLUSH_DEBOUNCE_MS = 250L
+        private const val RETRY_INTERVAL_MS = 3_000L
     }
+}
+
+sealed interface MeshTransportEvent {
+    data class Forwarded(
+        val packetId: String,
+        val peerNodeId: String,
+        val finalDestination: Boolean,
+    ) : MeshTransportEvent
+
+    data class SendFailed(
+        val packetId: String,
+        val peerNodeId: String,
+    ) : MeshTransportEvent
 }
 
 sealed interface MeshNodeStartResult {
