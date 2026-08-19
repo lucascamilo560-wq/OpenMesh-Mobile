@@ -15,6 +15,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.openmesh.android.AndroidMeshIdentityStore
 import com.openmesh.android.BleMeshNode
 import com.openmesh.android.MeshNodeService
 import com.openmesh.android.MeshRadioGuard
@@ -25,7 +26,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
-import java.util.UUID
 
 class MainActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -36,12 +36,10 @@ class MainActivity : Activity() {
     private var bound = false
     private var deliveryJob: Job? = null
 
-    private val nodeId: String by lazy {
-        val prefs = getSharedPreferences("openmesh_demo", MODE_PRIVATE)
-        prefs.getString("node_id", null) ?: "demo-${UUID.randomUUID()}".also {
-            prefs.edit().putString("node_id", it).apply()
-        }
+    private val identity by lazy {
+        AndroidMeshIdentityStore(this).loadOrCreate()
     }
+    private val nodeId: String by lazy { identity.nodeId }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
