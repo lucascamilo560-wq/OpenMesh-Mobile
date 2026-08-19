@@ -11,11 +11,14 @@ class MeshRouter(
     private val _deliveries = MutableSharedFlow<MeshEnvelope>(extraBufferCapacity = 64)
     val deliveries: SharedFlow<MeshEnvelope> = _deliveries.asSharedFlow()
 
-    suspend fun createLocal(packet: MeshEnvelope): IngestResult {
+    suspend fun createLocal(
+        packet: MeshEnvelope,
+        nowMs: Long = System.currentTimeMillis(),
+    ): IngestResult {
         require(packet.sourceNodeId == localNodeId) {
             "Local packet source must match localNodeId"
         }
-        return ingest(packet)
+        return ingest(packet, nowMs)
     }
 
     suspend fun ingest(packet: MeshEnvelope, nowMs: Long = System.currentTimeMillis()): IngestResult {
