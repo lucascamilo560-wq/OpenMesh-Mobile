@@ -40,6 +40,7 @@ class BleMeshNode(
     private val scanner = BleMeshScanner(appContext)
     private val identityClient = BlePeerIdentityClient(appContext)
     private val client = BleMeshGattClient(appContext)
+    private val verifiedPeerKeyStore = VerifiedPeerKeyStore(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activePeerJobs = ConcurrentHashMap<String, Job>()
     private val lastPeerSyncAt = ConcurrentHashMap<String, Long>()
@@ -125,7 +126,14 @@ class BleMeshNode(
     }
 
     /** Returns a peer public key only after private-key possession was verified. */
-    fun knownPeerPublicKey(nodeId: String): String? = peerPublicKeys[nodeId]
+    fun knownPeerPublicKey(nodeId: String): String? =
+        peerPublicKeys[nodeId]
+            ?: verifiedPeerKeyStore.getVerifiedPublicKey(nodeId)?.also { key ->
+                peerPublicKeys[nodeId] = key
+            }
+
+    fun verifiedPeerMetadata(nodeId: String): VerifiedPeerMetadata? =
+        verifiedPeerKeyStore.metadata(nodeId)
 
     /**
      * Queues an E2E encrypted unicast envelope. The caller must already possess
@@ -173,7 +181,15 @@ class BleMeshNode(
                             resolvedPeersByAddress[address] = identity
                             if (identity.possessionVerified) {
                                 identity.publicKeyBase64?.let { key ->
-                                    peerPublicKeys[identity.nodeId] = key
+                                    val persisted = runCatching {
+                                        verifiedPeerKeyStore.putVerified(
+                                            nodeId = identity.nodeId,
+                                            publicKeyBase64 = key,
+                                        )
+                                    }.isSuccess
+                                    if (persisted) {
+                                        peerPublicKeys[identity.nodeId] = key
+                                    }
                                 }
                             }
                         }
