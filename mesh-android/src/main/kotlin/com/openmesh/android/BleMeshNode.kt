@@ -5,6 +5,7 @@ import android.util.Base64
 import com.openmesh.core.IngestResult
 import com.openmesh.core.MeshEnvelope
 import com.openmesh.core.MeshKeyPair
+import com.openmesh.core.MeshNodeId
 import com.openmesh.core.MeshRouter
 import com.openmesh.core.PacketPriority
 import com.openmesh.core.PacketStore
@@ -16,7 +17,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
-import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -40,7 +40,6 @@ class BleMeshNode(
     private val activePeerJobs = ConcurrentHashMap<String, Job>()
     private val lastPeerSyncAt = ConcurrentHashMap<String, Long>()
     private val peerKnownPacketIds = ConcurrentHashMap<String, MutableSet<String>>()
-    private val localFingerprint = fingerprint(localNodeId)
 
     private val server = BleMeshGattServer(appContext) { envelope ->
         router.ingest(envelope)
@@ -49,6 +48,10 @@ class BleMeshNode(
     val deliveries: SharedFlow<MeshEnvelope> = router.deliveries
 
     fun start(): MeshNodeStartResult {
+        if (!MeshNodeId.isValid(localNodeId)) {
+            return MeshNodeStartResult.TransportFailure("invalid-node-id")
+        }
+
         val snapshot = guard.snapshot()
         if (!snapshot.bluetoothAvailable) return MeshNodeStartResult.BluetoothUnavailable
         if (snapshot.missingBlePermissions.isNotEmpty()) {
@@ -136,24 +139,24 @@ class BleMeshNode(
     }
 
     private fun onPeerSeen(peer: PeerAdvertisement) {
-        if (peer.nodeFingerprint == localFingerprint) return
-        val peerKey = peer.nodeFingerprint
+        if (peer.nodeId == localNodeId) return
+        val peerNodeId = peer.nodeId
         val now = System.currentTimeMillis()
-        val previous = lastPeerSyncAt[peerKey] ?: 0L
+        val previous = lastPeerSyncAt[peerNodeId] ?: 0L
         if (now - previous < PEER_SYNC_COOLDOWN_MS) return
-        lastPeerSyncAt[peerKey] = now
+        lastPeerSyncAt[peerNodeId] = now
 
-        activePeerJobs.compute(peerKey) { _, existing ->
+        activePeerJobs.compute(peerNodeId) { _, existing ->
             if (existing?.isActive == true) return@compute existing
             scope.launch {
                 try {
-                    val known = peerKnownPacketIds.computeIfAbsent(peerKey) {
+                    val known = peerKnownPacketIds.computeIfAbsent(peerNodeId) {
                         ConcurrentHashMap.newKeySet<String>()
                     }
                     if (known.size > MAX_KNOWN_PACKETS_PER_PEER) known.clear()
 
                     val batch = router.nextBatchForPeer(
-                        peerNodeId = peerKey,
+                        peerNodeId = peerNodeId,
                         peerKnownPacketIds = known,
                         limit = MAX_PACKETS_PER_CONTACT,
                     )
@@ -163,16 +166,11 @@ class BleMeshNode(
                         known.add(envelope.packetId)
                     }
                 } finally {
-                    activePeerJobs.remove(peerKey)
+                    activePeerJobs.remove(peerNodeId)
                 }
             }
         }
     }
-
-    private fun fingerprint(nodeId: String): String = MessageDigest.getInstance("SHA-256")
-        .digest(nodeId.encodeToByteArray())
-        .copyOfRange(0, 8)
-        .joinToString(separator = "") { "%02x".format(it) }
 
     companion object {
         const val DEFAULT_TTL_MS = 72L * 60L * 60L * 1000L
