@@ -37,7 +37,9 @@ class SharedPreferencesPacketStore(
     }
 
     override suspend fun remove(packetId: String) = mutex.withLock {
-        preferences.edit().remove(key(packetId)).commit()
+        check(preferences.edit().remove(key(packetId)).commit()) {
+            "Unable to remove OpenMesh packet $packetId"
+        }
     }
 
     override suspend fun list(): List<MeshEnvelope> = mutex.withLock {
