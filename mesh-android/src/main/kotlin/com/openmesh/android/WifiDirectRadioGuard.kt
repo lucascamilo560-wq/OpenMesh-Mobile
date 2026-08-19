@@ -18,11 +18,12 @@ class WifiDirectRadioGuard(
         val supported = packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT)
         val wifiManager = appContext.getSystemService(WifiManager::class.java)
         val locationManager = appContext.getSystemService(LocationManager::class.java)
+        val locationRequired = Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2
 
         return WifiDirectRadioSnapshot(
             supported = supported,
             wifiEnabled = wifiManager?.isWifiEnabled == true,
-            locationModeEnabled = locationManager?.isLocationEnabled == true,
+            locationModeEnabled = !locationRequired || locationManager?.isLocationEnabled == true,
             missingPermissions = missingPermissions(),
         )
     }
