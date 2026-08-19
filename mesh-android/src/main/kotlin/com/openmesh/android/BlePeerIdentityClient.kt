@@ -5,16 +5,22 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Build
 import com.openmesh.core.MeshCrypto
 import com.openmesh.core.MeshNodeId
+import com.openmesh.core.PeerIdentityProof
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** Resolves the exact OpenMesh node ID, and public key when exposed, after BLE discovery. */
+/**
+ * Resolves the exact OpenMesh node ID after BLE discovery and, when the peer
+ * exposes a public key, verifies private-key possession with a fresh signed
+ * challenge before marking that key as trusted for secure transport.
+ */
 class BlePeerIdentityClient(
     context: Context,
 ) {
@@ -23,7 +29,7 @@ class BlePeerIdentityClient(
     @SuppressLint("MissingPermission")
     suspend fun resolve(
         deviceAddress: String,
-        timeoutMs: Long = 10_000,
+        timeoutMs: Long = 12_000,
     ): ResolvedPeerIdentity? {
         val manager = appContext.getSystemService(BluetoothManager::class.java) ?: return null
         val adapter = manager.adapter ?: return null
@@ -33,13 +39,32 @@ class BlePeerIdentityClient(
         var gatt: BluetoothGatt? = null
         var nodeIdCharacteristic: BluetoothGattCharacteristic? = null
         var publicKeyCharacteristic: BluetoothGattCharacteristic? = null
+        var challengeCharacteristic: BluetoothGattCharacteristic? = null
+        var proofCharacteristic: BluetoothGattCharacteristic? = null
         var resolvedNodeId: String? = null
+        var resolvedPublicKey: String? = null
+        var pendingChallenge: ByteArray? = null
         var finished = false
 
         fun finish(result: ResolvedPeerIdentity?) {
             if (finished) return
             finished = true
             completion.complete(result)
+        }
+
+        fun finishUnverified() {
+            val nodeId = resolvedNodeId
+            if (nodeId == null) {
+                finish(null)
+            } else {
+                finish(
+                    ResolvedPeerIdentity(
+                        nodeId = nodeId,
+                        publicKeyBase64 = resolvedPublicKey,
+                        possessionVerified = false,
+                    )
+                )
+            }
         }
 
         @SuppressLint("MissingPermission")
@@ -51,13 +76,47 @@ class BlePeerIdentityClient(
         }
 
         @SuppressLint("MissingPermission")
-        fun readPublicKeyOrFinish(activeGatt: BluetoothGatt, nodeId: String) {
+        fun readPublicKeyOrFinish(activeGatt: BluetoothGatt) {
             val characteristic = publicKeyCharacteristic
             if (characteristic == null) {
-                finish(ResolvedPeerIdentity(nodeId = nodeId, publicKeyBase64 = null))
+                finishUnverified()
                 return
             }
-            if (!activeGatt.readCharacteristic(characteristic)) finish(null)
+            if (!activeGatt.readCharacteristic(characteristic)) finishUnverified()
+        }
+
+        @SuppressLint("MissingPermission")
+        fun writeChallenge(activeGatt: BluetoothGatt): Boolean {
+            val characteristic = challengeCharacteristic ?: return false
+            if (proofCharacteristic == null) return false
+
+            val challenge = PeerIdentityProof.newChallenge()
+            pendingChallenge = challenge
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+            val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                activeGatt.writeCharacteristic(
+                    characteristic,
+                    challenge,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = challenge
+                @Suppress("DEPRECATION")
+                activeGatt.writeCharacteristic(characteristic)
+            }
+
+            if (!accepted) finishUnverified()
+            return accepted
+        }
+
+        @SuppressLint("MissingPermission")
+        fun readProof(activeGatt: BluetoothGatt) {
+            val characteristic = proofCharacteristic
+            if (characteristic == null || !activeGatt.readCharacteristic(characteristic)) {
+                finishUnverified()
+            }
         }
 
         fun handleRead(
@@ -67,7 +126,7 @@ class BlePeerIdentityClient(
             status: Int,
         ) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                finish(null)
+                finishUnverified()
                 return
             }
 
@@ -83,7 +142,7 @@ class BlePeerIdentityClient(
                         return
                     }
                     resolvedNodeId = nodeId
-                    readPublicKeyOrFinish(activeGatt, nodeId)
+                    readPublicKeyOrFinish(activeGatt)
                 }
 
                 BleMeshProtocol.PUBLIC_KEY_CHARACTERISTIC_UUID -> {
@@ -93,15 +152,53 @@ class BlePeerIdentityClient(
                     }
                     val publicKey = runCatching { value.decodeToString() }.getOrNull()
                     if (publicKey.isNullOrBlank()) {
-                        finish(null)
+                        finishUnverified()
                         return
                     }
+
                     val keyNodeId = runCatching { MeshCrypto.nodeId(publicKey) }.getOrNull()
                     if (keyNodeId != nodeId) {
+                        // The advertised/resolved routing identity and key disagree.
+                        // Keep routing possible, but never expose the mismatched key.
+                        resolvedPublicKey = null
+                        finishUnverified()
+                        return
+                    }
+
+                    resolvedPublicKey = publicKey
+                    if (!writeChallenge(activeGatt)) {
+                        finishUnverified()
+                    }
+                }
+
+                BleMeshProtocol.IDENTITY_PROOF_CHARACTERISTIC_UUID -> {
+                    val nodeId = resolvedNodeId ?: run {
                         finish(null)
                         return
                     }
-                    finish(ResolvedPeerIdentity(nodeId, publicKey))
+                    val publicKey = resolvedPublicKey ?: run {
+                        finishUnverified()
+                        return
+                    }
+                    val challenge = pendingChallenge ?: run {
+                        finishUnverified()
+                        return
+                    }
+                    val signature = runCatching { value.decodeToString() }.getOrNull()
+                    val verified = !signature.isNullOrBlank() && PeerIdentityProof.verify(
+                        challenge = challenge,
+                        nodeId = nodeId,
+                        publicKeyBase64 = publicKey,
+                        signatureBase64 = signature,
+                    )
+
+                    finish(
+                        ResolvedPeerIdentity(
+                            nodeId = nodeId,
+                            publicKeyBase64 = publicKey,
+                            possessionVerified = verified,
+                        )
+                    )
                 }
             }
         }
@@ -135,6 +232,8 @@ class BlePeerIdentityClient(
                         return
                     }
                 publicKeyCharacteristic = service.getCharacteristic(BleMeshProtocol.PUBLIC_KEY_CHARACTERISTIC_UUID)
+                challengeCharacteristic = service.getCharacteristic(BleMeshProtocol.IDENTITY_CHALLENGE_CHARACTERISTIC_UUID)
+                proofCharacteristic = service.getCharacteristic(BleMeshProtocol.IDENTITY_PROOF_CHARACTERISTIC_UUID)
 
                 if (!activeGatt.requestMtu(PREFERRED_MTU)) {
                     readNodeId(activeGatt)
@@ -143,6 +242,19 @@ class BlePeerIdentityClient(
 
             override fun onMtuChanged(activeGatt: BluetoothGatt, mtu: Int, status: Int) {
                 readNodeId(activeGatt)
+            }
+
+            override fun onCharacteristicWrite(
+                activeGatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (characteristic.uuid != BleMeshProtocol.IDENTITY_CHALLENGE_CHARACTERISTIC_UUID) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    finishUnverified()
+                    return
+                }
+                readProof(activeGatt)
             }
 
             @Deprecated("Used for Android versions below API 33")
@@ -191,4 +303,5 @@ class BlePeerIdentityClient(
 data class ResolvedPeerIdentity(
     val nodeId: String,
     val publicKeyBase64: String?,
+    val possessionVerified: Boolean,
 )
