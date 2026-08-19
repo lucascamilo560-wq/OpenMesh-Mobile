@@ -22,27 +22,41 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Android-first OpenMesh node.
  *
- * A node advertises itself, scans nearby nodes, accepts incoming envelopes and
- * opportunistically forwards locally persisted envelopes whenever a peer appears.
+ * BLE advertising only announces presence. After discovery, the exact routable
+ * node ID is resolved from GATT before any packet is forwarded.
  */
 class BleMeshNode(
     context: Context,
     val localNodeId: String,
     store: PacketStore = SharedPreferencesPacketStore(context),
+    private val localIdentity: MeshKeyPair? = null,
 ) {
     private val appContext = context.applicationContext
     private val guard = MeshRadioGuard(appContext)
     private val router = MeshRouter(localNodeId, store)
     private val advertiser = BleMeshAdvertiser(appContext)
     private val scanner = BleMeshScanner(appContext)
+    private val identityClient = BlePeerIdentityClient(appContext)
     private val client = BleMeshGattClient(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activePeerJobs = ConcurrentHashMap<String, Job>()
     private val lastPeerSyncAt = ConcurrentHashMap<String, Long>()
     private val peerKnownPacketIds = ConcurrentHashMap<String, MutableSet<String>>()
+    private val resolvedPeersByAddress = ConcurrentHashMap<String, ResolvedPeerIdentity>()
+    private val peerPublicKeys = ConcurrentHashMap<String, String>()
 
-    private val server = BleMeshGattServer(appContext) { envelope ->
+    private val server = BleMeshGattServer(
+        context = appContext,
+        localNodeId = localNodeId,
+        localPublicKeyBase64 = localIdentity?.publicKeyBase64,
+    ) { envelope ->
         router.ingest(envelope)
+    }
+
+    init {
+        require(localIdentity == null || localIdentity.nodeId == localNodeId) {
+            "Local identity does not match localNodeId"
+        }
     }
 
     val deliveries: SharedFlow<MeshEnvelope> = router.deliveries
@@ -108,10 +122,13 @@ class BleMeshNode(
         return envelope
     }
 
+    /** Returns a public key learned from a directly resolved peer, when known. */
+    fun knownPeerPublicKey(nodeId: String): String? = peerPublicKeys[nodeId]
+
     /**
      * Queues an E2E encrypted unicast envelope. The caller must already possess
-     * an authenticated recipient public key; nearby advertisements are not
-     * automatically trusted as identity proof.
+     * an authenticated recipient public key; nearby advertisements alone are not
+     * treated as identity proof.
      */
     suspend fun sendSecure(
         payload: ByteArray,
@@ -139,17 +156,28 @@ class BleMeshNode(
     }
 
     private fun onPeerSeen(peer: PeerAdvertisement) {
-        if (peer.nodeId == localNodeId) return
-        val peerNodeId = peer.nodeId
+        val address = peer.deviceAddress
         val now = System.currentTimeMillis()
-        val previous = lastPeerSyncAt[peerNodeId] ?: 0L
+        val previous = lastPeerSyncAt[address] ?: 0L
         if (now - previous < PEER_SYNC_COOLDOWN_MS) return
-        lastPeerSyncAt[peerNodeId] = now
+        lastPeerSyncAt[address] = now
 
-        activePeerJobs.compute(peerNodeId) { _, existing ->
+        activePeerJobs.compute(address) { _, existing ->
             if (existing?.isActive == true) return@compute existing
             scope.launch {
                 try {
+                    val resolved = resolvedPeersByAddress[address]
+                        ?: identityClient.resolve(address)?.also { identity ->
+                            resolvedPeersByAddress[address] = identity
+                            identity.publicKeyBase64?.let { key ->
+                                peerPublicKeys[identity.nodeId] = key
+                            }
+                        }
+                        ?: return@launch
+
+                    val peerNodeId = resolved.nodeId
+                    if (peerNodeId == localNodeId) return@launch
+
                     val known = peerKnownPacketIds.computeIfAbsent(peerNodeId) {
                         ConcurrentHashMap.newKeySet<String>()
                     }
@@ -161,12 +189,15 @@ class BleMeshNode(
                         limit = MAX_PACKETS_PER_CONTACT,
                     )
                     for (envelope in batch) {
-                        val deliveredToPeer = client.send(peer.deviceAddress, envelope)
-                        if (!deliveredToPeer) break
+                        val deliveredToPeer = client.send(address, envelope)
+                        if (!deliveredToPeer) {
+                            resolvedPeersByAddress.remove(address)
+                            break
+                        }
                         known.add(envelope.packetId)
                     }
                 } finally {
-                    activePeerJobs.remove(peerNodeId)
+                    activePeerJobs.remove(address)
                 }
             }
         }
