@@ -6,7 +6,7 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.content.Context
-import java.security.MessageDigest
+import com.openmesh.core.MeshNodeId
 
 class BleMeshAdvertiser(
     private val context: Context,
@@ -21,6 +21,11 @@ class BleMeshAdvertiser(
         if (activeCallback != null) return true
 
         val advertiser = adapter?.bluetoothLeAdvertiser ?: return false
+        val compactNodeId = runCatching { MeshNodeId.toAdvertisementBytes(nodeId) }
+            .getOrElse {
+                onResult(AdvertiseState.INVALID_NODE_ID)
+                return false
+            }
 
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
@@ -33,7 +38,7 @@ class BleMeshAdvertiser(
             .addServiceUuid(BleMeshProtocol.SERVICE_PARCEL_UUID)
             .addServiceData(
                 BleMeshProtocol.SERVICE_PARCEL_UUID,
-                nodeFingerprint(nodeId),
+                compactNodeId,
             )
             .build()
 
@@ -59,14 +64,10 @@ class BleMeshAdvertiser(
         adapter?.bluetoothLeAdvertiser?.stopAdvertising(callback)
         activeCallback = null
     }
-
-    private fun nodeFingerprint(nodeId: String): ByteArray =
-        MessageDigest.getInstance("SHA-256")
-            .digest(nodeId.encodeToByteArray())
-            .copyOfRange(0, 8)
 }
 
 sealed interface AdvertiseState {
     data object ACTIVE : AdvertiseState
+    data object INVALID_NODE_ID : AdvertiseState
     data class FAILED(val errorCode: Int) : AdvertiseState
 }
