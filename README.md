@@ -20,6 +20,7 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 - Per-peer delivery memory to reduce repeated retransmissions.
 - `MeshRadioGuard` for missing permissions, Bluetooth state and radio capability.
 - Foreground `connectedDevice` service for active participation.
+- Bluetooth state monitoring: the service pauses transport when Bluetooth is disabled, preserves queued packets, updates the foreground notification and attempts to rejoin automatically after Bluetooth is enabled again.
 - ECDH shared-secret derivation, AES-GCM authenticated encryption and ECDSA signatures in `mesh-core`.
 - Tests covering alternate routing when an intermediate node is offline, duplicate suppression and cryptographic round trips.
 
