@@ -6,13 +6,14 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 
 ## Current architecture
 
-- `mesh-core`: protocol envelope, TTL/hop rules, deduplication, store-and-forward router and cryptographic primitives. The code is transport-neutral; it is currently packaged as an Android library so every module can use AGP 9.3 built-in Kotlin consistently.
+- `mesh-core`: protocol envelope, canonical cryptographic node IDs, TTL/hop rules, deduplication, store-and-forward router and cryptographic primitives. The code is transport-neutral; it is currently packaged as an Android library so every module can use AGP 9.3 built-in Kotlin consistently.
 - `mesh-android`: radio permission supervision, BLE advertising/scanning, GATT sender/receiver, persistent packet storage, protected device identity and foreground node service.
 - `app`: dependency-light Android demo used to test two or more physical phones.
 
 ## Implemented
 
 - BLE peer discovery and connectable advertising.
+- Canonical BLE identity encoding: the 16-byte routable identity digest is advertised directly and reconstructed into the exact `om1-...` node ID used by the router.
 - GATT packet transport with fragmentation/reassembly for MTU-sized frames.
 - Store-and-forward routing with TTL, hop limit and priority.
 - Durable Android packet queue that survives process/device restarts.
@@ -25,7 +26,8 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 - Android identity persistence with the exported EC private material encrypted by a non-exportable AES key in Android Keystore.
 - ECDH shared-secret derivation, AES-GCM authenticated encryption and ECDSA signatures in `mesh-core`.
 - High-level E2E envelope API that binds immutable routing metadata to encryption/signatures while allowing relay-only hop metadata to change safely.
-- Tests covering alternate routing when an intermediate node is offline, duplicate suppression, anti-echo behavior, cryptographic round trips, relay-safe encrypted delivery and routing-header tamper rejection.
+- Android `sendSecure()` API for encrypted unicast when the caller already possesses an authenticated recipient public key.
+- Tests covering alternate routing when an intermediate node is offline, duplicate suppression, anti-echo behavior, node-ID advertisement round trips, cryptographic round trips, relay-safe encrypted delivery and routing-header tamper rejection.
 
 ## Example resilience scenario
 
