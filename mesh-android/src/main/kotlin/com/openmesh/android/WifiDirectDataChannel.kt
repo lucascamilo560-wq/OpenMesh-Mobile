@@ -22,8 +22,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Persistent full-duplex TCP channel running over a formed Wi-Fi Direct group.
  *
- * The framing layer is payload-agnostic. Mesh envelopes are supported directly,
- * while future media/file protocols can use [WifiDirectSocketSession.sendFrame].
+ * Sessions are returned with their reader stopped so the caller can attach
+ * identity/authentication handlers before the first remote frame is consumed.
  */
 class WifiDirectDataChannel(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
@@ -47,9 +47,7 @@ class WifiDirectDataChannel(
         acceptJob = scope.launch {
             while (isActive && !server.isClosed) {
                 val socket = runCatching { server.accept() }.getOrNull() ?: break
-                val session = WifiDirectSocketSession(socket, scope)
-                onSession(session)
-                session.startReading()
+                onSession(WifiDirectSocketSession(socket, scope))
             }
         }
         true
@@ -71,7 +69,7 @@ class WifiDirectDataChannel(
             runCatching { socket.close() }
             return@withContext null
         }
-        WifiDirectSocketSession(socket, scope).also { it.startReading() }
+        WifiDirectSocketSession(socket, scope)
     }
 
     override fun close() {
@@ -102,6 +100,9 @@ class WifiDirectSocketSession internal constructor(
 
     val remoteAddress: String
         get() = socket.inetAddress?.hostAddress.orEmpty()
+
+    val isClosed: Boolean
+        get() = closed.get()
 
     fun onFrame(listener: (ByteArray) -> Unit) {
         synchronized(listenerLock) { listeners += listener }
