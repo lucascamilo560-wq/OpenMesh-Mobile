@@ -37,6 +37,7 @@ class BleMeshNode(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activePeerJobs = ConcurrentHashMap<String, Job>()
     private val lastPeerSyncAt = ConcurrentHashMap<String, Long>()
+    private val peerKnownPacketIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val localFingerprint = fingerprint(localNodeId)
 
     private val server = BleMeshGattServer(appContext) { envelope ->
@@ -104,24 +105,33 @@ class BleMeshNode(
 
     private fun onPeerSeen(peer: PeerAdvertisement) {
         if (peer.nodeFingerprint == localFingerprint) return
+        val peerKey = peer.nodeFingerprint
         val now = System.currentTimeMillis()
-        val previous = lastPeerSyncAt[peer.deviceAddress] ?: 0L
+        val previous = lastPeerSyncAt[peerKey] ?: 0L
         if (now - previous < PEER_SYNC_COOLDOWN_MS) return
-        lastPeerSyncAt[peer.deviceAddress] = now
+        lastPeerSyncAt[peerKey] = now
 
-        activePeerJobs.compute(peer.deviceAddress) { address, existing ->
+        activePeerJobs.compute(peerKey) { _, existing ->
             if (existing?.isActive == true) return@compute existing
             scope.launch {
                 try {
+                    val known = peerKnownPacketIds.computeIfAbsent(peerKey) {
+                        ConcurrentHashMap.newKeySet<String>()
+                    }
+                    if (known.size > MAX_KNOWN_PACKETS_PER_PEER) known.clear()
+
                     val batch = router.nextBatchForPeer(
-                        peerNodeId = peer.nodeFingerprint,
+                        peerNodeId = peerKey,
+                        peerKnownPacketIds = known,
                         limit = MAX_PACKETS_PER_CONTACT,
                     )
                     for (envelope in batch) {
-                        if (!client.send(address, envelope)) break
+                        val deliveredToPeer = client.send(peer.deviceAddress, envelope)
+                        if (!deliveredToPeer) break
+                        known.add(envelope.packetId)
                     }
                 } finally {
-                    activePeerJobs.remove(address)
+                    activePeerJobs.remove(peerKey)
                 }
             }
         }
@@ -135,6 +145,7 @@ class BleMeshNode(
     companion object {
         const val DEFAULT_TTL_MS = 72L * 60L * 60L * 1000L
         private const val MAX_PACKETS_PER_CONTACT = 8
+        private const val MAX_KNOWN_PACKETS_PER_PEER = 2_048
         private const val PEER_SYNC_COOLDOWN_MS = 15_000L
     }
 }
