@@ -135,6 +135,9 @@ class BleMeshNode(
     fun verifiedPeerMetadata(nodeId: String): VerifiedPeerMetadata? =
         verifiedPeerKeyStore.metadata(nodeId)
 
+    /** Snapshot of peers that have passed OpenMesh private-key possession verification. */
+    fun verifiedPeers(): List<VerifiedPeerMetadata> = verifiedPeerKeyStore.listVerified()
+
     /**
      * Queues an E2E encrypted unicast envelope. The caller must already possess
      * an authenticated recipient public key; nearby advertisements alone are not
