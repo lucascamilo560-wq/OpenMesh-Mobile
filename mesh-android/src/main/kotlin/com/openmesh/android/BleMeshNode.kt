@@ -23,7 +23,9 @@ import java.util.concurrent.ConcurrentHashMap
  * Android-first OpenMesh node.
  *
  * BLE advertising only announces presence. After discovery, the exact routable
- * node ID is resolved from GATT before any packet is forwarded.
+ * node ID is resolved from GATT before any packet is forwarded. Public keys are
+ * exposed to callers only after the peer proves possession of the matching
+ * private key with a fresh signed challenge.
  */
 class BleMeshNode(
     context: Context,
@@ -48,7 +50,7 @@ class BleMeshNode(
     private val server = BleMeshGattServer(
         context = appContext,
         localNodeId = localNodeId,
-        localPublicKeyBase64 = localIdentity?.publicKeyBase64,
+        localIdentity = localIdentity,
     ) { envelope ->
         router.ingest(envelope)
     }
@@ -122,7 +124,7 @@ class BleMeshNode(
         return envelope
     }
 
-    /** Returns a public key learned from a directly resolved peer, when known. */
+    /** Returns a peer public key only after private-key possession was verified. */
     fun knownPeerPublicKey(nodeId: String): String? = peerPublicKeys[nodeId]
 
     /**
@@ -169,8 +171,10 @@ class BleMeshNode(
                     val resolved = resolvedPeersByAddress[address]
                         ?: identityClient.resolve(address)?.also { identity ->
                             resolvedPeersByAddress[address] = identity
-                            identity.publicKeyBase64?.let { key ->
-                                peerPublicKeys[identity.nodeId] = key
+                            if (identity.possessionVerified) {
+                                identity.publicKeyBase64?.let { key ->
+                                    peerPublicKeys[identity.nodeId] = key
+                                }
                             }
                         }
                         ?: return@launch
