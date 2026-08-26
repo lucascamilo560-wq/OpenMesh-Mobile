@@ -256,14 +256,18 @@ class GattDiagnosticActivity : Activity() {
         transportJob = scope.launch {
             active.transportEvents.collect { event ->
                 when (event) {
-                    is MeshTransportEvent.Forwarded -> {
+                    is MeshTransportEvent.LinkWriteCompleted -> {
                         outgoing[event.packetId]?.let { view ->
                             view.text = replaceState(
                                 view.text.toString(),
-                                "✓ GATT OK • ${event.frameCount} frames"
+                                "✓ escrita GATT concluída • ${event.frameCount} frames • entrega não confirmada"
                             )
                         }
-                        log("OK ${event.packetId.take(8)} → ${shortId(event.peerNodeId)}; frames=${event.frameCount}; final=${event.finalDestination}")
+                        log(
+                            "LINK_WRITE_COMPLETED ${event.packetId.take(8)} → " +
+                                "${shortId(event.peerNodeId)}; frames=${event.frameCount}; " +
+                                "peerIsDestination=${event.peerIsDestination}; entrega=não confirmada"
+                        )
                     }
                     is MeshTransportEvent.SendFailed -> {
                         val frameIndex = event.frameIndex

@@ -281,12 +281,12 @@ class ChatActivity : Activity() {
         transportJob = scope.launch {
             activeNode.transportEvents.collect { event ->
                 when (event) {
-                    is MeshTransportEvent.Forwarded -> {
+                    is MeshTransportEvent.LinkWriteCompleted -> {
                         val view = outgoingViews[event.packetId]
-                        val state = if (event.finalDestination) {
-                            "✓ entregue ao peer por BLE"
+                        val state = if (event.peerIsDestination) {
+                            "✓ escrita BLE concluída no peer • entrega não confirmada"
                         } else {
-                            "↗ encaminhada por relay ${shortId(event.peerNodeId)}"
+                            "↗ escrita BLE concluída no relay ${shortId(event.peerNodeId)} • entrega não confirmada"
                         }
                         if (view != null) {
                             view.text = replaceStateLine(view.text.toString(), state)

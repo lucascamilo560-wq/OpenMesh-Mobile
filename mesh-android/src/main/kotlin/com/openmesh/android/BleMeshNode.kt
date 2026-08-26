@@ -303,11 +303,11 @@ class BleMeshNode(
                 is BleGattSendResult.Success -> {
                     known.add(envelope.packetId)
                     _transportEvents.emit(
-                        MeshTransportEvent.Forwarded(
+                        transportEventForSuccessfulGattWrite(
+                            result = result,
                             packetId = envelope.packetId,
                             peerNodeId = peerNodeId,
-                            finalDestination = envelope.destinationNodeId == peerNodeId,
-                            frameCount = result.frameCount,
+                            peerIsDestination = envelope.destinationNodeId == peerNodeId,
                         )
                     )
                 }
@@ -343,10 +343,18 @@ class BleMeshNode(
 }
 
 sealed interface MeshTransportEvent {
-    data class Forwarded(
+    /**
+     * The local GATT write procedure completed for every frame.
+     *
+     * This is link-local evidence only. It does not prove that the peer
+     * reassembled, validated or durably stored the packet, and it never means
+     * destination or application delivery.
+     */
+    data class LinkWriteCompleted(
         val packetId: String,
         val peerNodeId: String,
-        val finalDestination: Boolean,
+        /** Routing-header comparison only; not evidence of delivery. */
+        val peerIsDestination: Boolean,
         val frameCount: Int,
     ) : MeshTransportEvent
 
@@ -360,6 +368,18 @@ sealed interface MeshTransportEvent {
         val detail: String? = null,
     ) : MeshTransportEvent
 }
+
+internal fun transportEventForSuccessfulGattWrite(
+    result: BleGattSendResult.Success,
+    packetId: String,
+    peerNodeId: String,
+    peerIsDestination: Boolean,
+): MeshTransportEvent = MeshTransportEvent.LinkWriteCompleted(
+    packetId = packetId,
+    peerNodeId = peerNodeId,
+    peerIsDestination = peerIsDestination,
+    frameCount = result.frameCount,
+)
 
 sealed interface MeshNodeStartResult {
     data object Started : MeshNodeStartResult
