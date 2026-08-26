@@ -23,7 +23,7 @@ OpenMesh Mobile is an independent project designed to let nearby smartphones dis
 - Store-and-forward routing with TTL, hop limit and priority.
 - Durable Android packet queue that survives process/device restarts.
 - Duplicate suppression and final-recipient anti-echo routing.
-- Per-peer delivery memory to reduce repeated retransmissions.
+- Per-peer link-write memory to reduce repeated retransmissions during the current process lifetime.
 - `MeshRadioGuard` for missing permissions, Bluetooth state and radio capability.
 - Foreground `connectedDevice` service for active participation.
 - Bluetooth state monitoring: the service pauses transport when Bluetooth is disabled, preserves queued packets, updates the foreground notification and attempts to rejoin automatically after Bluetooth is enabled again.
