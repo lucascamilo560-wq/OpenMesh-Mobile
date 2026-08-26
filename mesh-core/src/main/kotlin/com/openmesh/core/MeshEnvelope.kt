@@ -105,7 +105,7 @@ object MeshEnvelopeCodec {
         val payloadBase64 = input.readString()
         val signatureBase64 = input.readNullableString()
 
-        MeshEnvelope(
+        val envelope = MeshEnvelope(
             protocolVersion = protocolVersion,
             packetId = packetId,
             sourceNodeId = sourceNodeId,
@@ -120,6 +120,8 @@ object MeshEnvelopeCodec {
             payloadBase64 = payloadBase64,
             signatureBase64 = signatureBase64,
         )
+        require(input.available() == 0) { "Unexpected trailing OpenMesh envelope data" }
+        envelope
     }
 
     private fun DataOutputStream.writeString(value: String) {

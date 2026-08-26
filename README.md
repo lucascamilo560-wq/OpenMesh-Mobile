@@ -52,6 +52,12 @@ If no relay is available, A retains the envelope until another eligible peer app
 
 The project targets Android API 36 with AGP 9.3, Gradle 9.5 and JDK 17. CI builds the demo and Android library and executes the core unit tests on pushes and pull requests.
 
+Use the committed wrapper so local and CI builds run the same Gradle distribution:
+
+```bash
+./gradlew :mesh-core:testDebugUnitTest :mesh-android:testDebugUnitTest :mesh-android:assembleDebug :app:assembleDebug
+```
+
 ## Next protocol work
 
 - Persistent delivery acknowledgements and peer-known packet summaries to reduce redundant flooding across restarts.
