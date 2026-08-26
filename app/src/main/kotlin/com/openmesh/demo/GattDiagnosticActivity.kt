@@ -20,6 +20,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import com.openmesh.android.AndroidMeshIdentityStore
 import com.openmesh.android.BleMeshNode
+import com.openmesh.android.LegacyV1DeliveryService
+import com.openmesh.android.LegacyV1EndpointBridge
 import com.openmesh.android.MeshNodeService
 import com.openmesh.android.MeshRadioGuard
 import com.openmesh.android.MeshTransportEvent
@@ -29,6 +31,8 @@ import com.openmesh.android.WifiDirectSocketSession
 import com.openmesh.android.WifiDirectUpgradeCoordinator
 import com.openmesh.android.WifiDirectUpgradeEvent
 import com.openmesh.android.WifiDirectUpgradeResult
+import com.openmesh.core.DeliveryPolicy
+import com.openmesh.core.DeliveryService
 import com.openmesh.core.SecureMeshMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +63,7 @@ class GattDiagnosticActivity : Activity() {
     private var bound = false
     private var service: MeshNodeService? = null
     private var node: BleMeshNode? = null
+    private var deliveryService: DeliveryService? = null
     private var selectedPeer: VerifiedPeerMetadata? = null
     private var deliveryJob: Job? = null
     private var transportJob: Job? = null
@@ -237,6 +242,15 @@ class GattDiagnosticActivity : Activity() {
         if (node === active) return
         detachNode()
         node = active
+        deliveryService = LegacyV1DeliveryService(
+            node = active,
+            senderIdentity = identity,
+            resolveEndpoint = { endpoint ->
+                selectedPeer
+                    ?.let(LegacyV1EndpointBridge::bind)
+                    ?.takeIf { it.endpointId == endpoint }
+            },
+        )
         radioLabel.text = "Rádio: BLE ativo"
         log("Nó BLE anexado. Transporte usa MTU padrão 23 nesta versão de diagnóstico.")
 
@@ -306,26 +320,35 @@ class GattDiagnosticActivity : Activity() {
     }
 
     private fun sendMessage() {
-        val active = node ?: return log("Ative a OpenMesh primeiro")
+        val deliveries = deliveryService ?: return log("Ative a OpenMesh primeiro")
         val peer = selectedPeer ?: return log("Nenhum peer verificado")
         val text = input.text?.toString()?.trim().orEmpty()
         if (text.isBlank()) return
+        val destination = runCatching { LegacyV1EndpointBridge.bind(peer).endpointId }
+            .getOrElse {
+                log("Endpoint legado inválido: ${it.message}")
+                return
+            }
 
         scope.launch {
-            val envelope = runCatching {
-                active.sendSecure(
+            val handle = runCatching {
+                deliveries.deliver(
+                    destination = destination,
                     payload = text.encodeToByteArray(),
-                    contentType = CHAT_TYPE,
-                    senderIdentity = identity,
-                    recipientNodeId = peer.nodeId,
-                    recipientPublicKeyBase64 = peer.publicKeyBase64,
+                    policy = DeliveryPolicy(contentType = CHAT_TYPE),
                 )
             }.getOrElse {
                 log("Erro criando E2E: ${it.message}")
                 return@launch
             }
-            outgoing[envelope.packetId] = addOutgoing(text, "⏳ criado • aguardando GATT")
-            log("Criado ${envelope.packetId.take(8)} para ${shortId(peer.nodeId)}")
+            outgoing[handle.requestId.value] = addOutgoing(
+                text,
+                "⏳ armazenada localmente • entrega não confirmada",
+            )
+            log(
+                "Intenção ${handle.requestId.value.take(8)} armazenada para " +
+                    "${destination.value}; transporte será decidido pelo runtime"
+            )
         }
     }
 
@@ -468,6 +491,7 @@ class GattDiagnosticActivity : Activity() {
     private fun detachNode() {
         deliveryJob?.cancel(); transportJob?.cancel(); peerJob?.cancel()
         deliveryJob = null; transportJob = null; peerJob = null
+        deliveryService = null
         node = null
         closeCoordinator()
     }

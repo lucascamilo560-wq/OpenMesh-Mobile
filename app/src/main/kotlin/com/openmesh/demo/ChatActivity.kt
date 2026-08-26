@@ -20,6 +20,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import com.openmesh.android.AndroidMeshIdentityStore
 import com.openmesh.android.BleMeshNode
+import com.openmesh.android.LegacyV1DeliveryService
+import com.openmesh.android.LegacyV1EndpointBridge
 import com.openmesh.android.MeshNodeService
 import com.openmesh.android.MeshRadioGuard
 import com.openmesh.android.MeshTransportEvent
@@ -29,6 +31,8 @@ import com.openmesh.android.WifiDirectSocketSession
 import com.openmesh.android.WifiDirectUpgradeCoordinator
 import com.openmesh.android.WifiDirectUpgradeEvent
 import com.openmesh.android.WifiDirectUpgradeResult
+import com.openmesh.core.DeliveryPolicy
+import com.openmesh.core.DeliveryService
 import com.openmesh.core.SecureMeshMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +67,7 @@ class ChatActivity : Activity() {
     private lateinit var fastTestButton: Button
 
     private var node: BleMeshNode? = null
+    private var deliveryService: DeliveryService? = null
     private var meshService: MeshNodeService? = null
     private var bound = false
     private var selectedPeer: VerifiedPeerMetadata? = null
@@ -263,6 +268,15 @@ class ChatActivity : Activity() {
         if (node === activeNode) return
         detachNode()
         node = activeNode
+        deliveryService = LegacyV1DeliveryService(
+            node = activeNode,
+            senderIdentity = identity,
+            resolveEndpoint = { endpoint ->
+                selectedPeer
+                    ?.let(LegacyV1EndpointBridge::bind)
+                    ?.takeIf { it.endpointId == endpoint }
+            },
+        )
         transportLabel.text = "Rádio: BLE ativo • procurando peers"
         setDiagnostic("Mesh ativa. Mensagens novas terão flush imediato + retry automático.")
 
@@ -322,6 +336,7 @@ class ChatActivity : Activity() {
         deliveryJob = null
         transportJob = null
         peerJob = null
+        deliveryService = null
         node = null
         closeUpgradeCoordinator()
     }
@@ -348,29 +363,37 @@ class ChatActivity : Activity() {
     }
 
     private fun sendChatMessage() {
-        val activeNode = node ?: return setDiagnostic("Ative a OpenMesh primeiro.")
+        val deliveries = deliveryService ?: return setDiagnostic("Ative a OpenMesh primeiro.")
         val peer = selectedPeer ?: return setDiagnostic("Nenhum peer verificado disponível.")
         val text = messageInput.text?.toString()?.trim().orEmpty()
         if (text.isBlank()) return
+        val destination = runCatching { LegacyV1EndpointBridge.bind(peer).endpointId }
+            .getOrElse {
+                setDiagnostic("Endpoint legado inválido: ${it.message}")
+                return
+            }
 
         scope.launch {
-            val envelope = runCatching {
-                activeNode.sendSecure(
+            val handle = runCatching {
+                deliveries.deliver(
+                    destination = destination,
                     payload = text.encodeToByteArray(),
-                    contentType = CHAT_CONTENT_TYPE,
-                    senderIdentity = identity,
-                    recipientNodeId = peer.nodeId,
-                    recipientPublicKeyBase64 = peer.publicKeyBase64,
+                    policy = DeliveryPolicy(contentType = CHAT_CONTENT_TYPE),
                 )
             }.getOrElse {
                 setDiagnostic("Falha ao criar mensagem E2E: ${it.message}")
                 return@launch
             }
 
-            val view = addOutgoingMessage(text, "⏳ na fila • flush imediato")
-            outgoingViews[envelope.packetId] = view
+            val view = addOutgoingMessage(
+                text,
+                "⏳ armazenada localmente • entrega não confirmada",
+            )
+            outgoingViews[handle.requestId.value] = view
             messageInput.text?.clear()
-            appendDiagnostic("Mensagem ${envelope.packetId.take(8)} criada para ${shortId(peer.nodeId)}.")
+            appendDiagnostic(
+                "Intenção ${handle.requestId.value.take(8)} armazenada para ${destination.value}."
+            )
         }
     }
 
