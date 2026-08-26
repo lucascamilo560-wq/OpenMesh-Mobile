@@ -2,21 +2,23 @@
 
 | Campo | Valor |
 |---|---|
-| Estado | Proposta arquitetural; nenhuma alteração estrutural de runtime está incluída neste documento |
+| Estado | Baseline arquitetural, refinada pelas ADRs de 2026-08-25; nenhuma alteração estrutural de runtime está incluída |
 | Auditoria-base | `main@df2dcca20d697cb77bed790d924fe940bd25aaf0` (`2026-08-19`) |
-| Data da revisão | 2026-08-26 |
+| Data da revisão | 2026-08-25 (`America/Sao_Paulo`) |
 | Fonte de verdade | Código no commit acima; README e documentos de validação foram tratados como evidência secundária |
+
+> **Refinamento pós-spike:** as decisões normativas estão em [`docs/adr/`](adr/README.md), os 20 invariantes em [`OPENMESH_CONSTITUTIONAL_INVARIANTS.md`](OPENMESH_CONSTITUTIONAL_INVARIANTS.md) e o impacto consolidado em [`OPENMESH_ARCHITECTURE_V1_ADR_DELTA.md`](OPENMESH_ARCHITECTURE_V1_ADR_DELTA.md). Em conflito, a ADR mais recente governa. O runtime auditado permanece inalterado.
 
 ## Decisão executiva
 
 O OpenMesh atual é um protótipo Android coerente de **store-and-forward seguro sobre BLE**, com uma primitiva experimental de upgrade para Wi-Fi Direct. Ele ainda não é uma camada universal de entrega: a API, o runtime, a descoberta, a política de reenvio e o lifecycle estão concentrados em `BleMeshNode`; não existe contrato geral de transporte, modelo de oportunidade, recibo de aceitação durável, reconciliação persistente ou seleção entre meios.
 
-A missão proposta está correta, mas não é um paradigma novo em si. Ela coincide em grande parte com DTN, com o Bundle Protocol v7 (BPv7) e com a noção de *convergence-layer adapter*. A recomendação é **não criar agora um protocolo universal proprietário**. A primeira ADR deve comparar e prototipar:
+A missão proposta está correta, mas não é um paradigma novo em si. Ela coincide em grande parte com DTN, com o Bundle Protocol v7 (BPv7) e com a noção de *convergence-layer adapter*. A recomendação é **não criar um protocolo universal proprietário**. O spike da ADR-001 comparou:
 
 1. um perfil OpenMesh de BPv7 como formato canônico;
 2. um modelo interno que seja mapeável sem perda para BPv7, mantendo o envelope v1 apenas como legado encapsulado.
 
-A opção 1 é a preferência desta planta. Ela compra semântica já especificada para store-carry-forward, endpoint IDs, lifetime, fragmentação, bundle age, hop count, extension blocks e status reports. O diferencial defensável do OpenMesh pode surgir na execução Android: seleção explicável e energy-aware entre oportunidades heterogêneas, identidade self-certifying, experiência offline e gateways fáceis de incorporar. Isso é uma **hipótese de diferenciação**, não uma reivindicação de novidade técnica.
+A [ADR-001](adr/ADR-001-bpv7-wire-baseline.md) aceita a opção 1 como baseline canônico v2. O benchmark encontrou BPv7 mínimo entre +2,553% (32 B) e −24,525% (10 KiB) contra v1; o candidato BPv7+BPSec ficou 15,282%–24,560% menor que o E2E v1 modelado, embora a identidade assimétrica continue experimental. O diferencial defensável do OpenMesh pode surgir na execução Android: seleção explicável e energy-aware entre oportunidades heterogêneas, identidade self-certifying, experiência offline e gateways fáceis de incorporar. Isso é uma **hipótese de diferenciação**, não uma reivindicação de novidade técnica.
 
 ### Invariantes da arquitetura-alvo
 
@@ -385,7 +387,7 @@ O core não deve depender de Android, sockets, BLE, Wi-Fi ou de uma implementaç
 
 ## 13. Universal Envelope / Delivery Object
 
-### Decisão recomendada
+### Decisão aceita após o spike
 
 Usar **BPv7 (RFC 9171) como base canônica**, com um perfil OpenMesh estreito e extension blocks registrados/documentados. BPv7 já define o overlay store-and-forward, Bundle Protocol Agent, Application Agent, Convergence-Layer Adapter, endpoint IDs, lifetime, fragmentação, Previous Node, Bundle Age, Hop Count e status reports. Inventar equivalentes reduziria interoperabilidade e repetiria anos de trabalho.
 
@@ -393,9 +395,9 @@ O perfil deve considerar as atualizações normativas do BPv7, inclusive [RFC 97
 
 | Opção | Vantagem | Risco | Posição desta planta |
 |---|---|---|---|
-| BPv7 canônico | Semântica e interoperabilidade padronizadas | Complexidade e overhead em BLE precisam ser medidos | Preferida, condicionada ao spike |
-| Modelo interno lossless para BPv7 | Pode otimizar API/store sem expor BP à aplicação | Dois modelos podem divergir | Fallback aceitável com conformance tests |
-| Protocolo OpenMesh v2 independente | Controle total do wire | Repete DTN, cria ilha e amplia superfície criptográfica | Não recomendado sem evidência forte |
+| BPv7 canônico | Semântica e interoperabilidade padronizadas | Parser, BPSec e registry exigem gates | **Aceita pela ADR-001** |
+| Modelo interno lossless para BPv7 | Pode otimizar API/store sem expor BP à aplicação | Dois modelos podem divergir | Permitido apenas como modelo interno; wire v2 continua BPv7 |
+| Protocolo OpenMesh v2 independente | Controle total do wire | Repete DTN, cria ilha e amplia superfície criptográfica | **Rejeitado pela ADR-001** |
 
 O objeto lógico OpenMesh deve se dividir em:
 
@@ -413,9 +415,9 @@ O objeto lógico OpenMesh deve se dividir em:
 | Saltos | BP Hop Count block |
 | Último nó | BP Previous Node block |
 | Payload | BP payload block; ciphertext quando a política exigir E2E |
-| Fragmentação | Fragmentação BP e/ou segmentação resumível do CLA, decididas em camadas distintas |
-| Delivery status | Bundle Status Reports, perfilados e rate-limited |
-| Integridade/confidencialidade | BPSec (RFC 9172/9173) ou encapsulamento E2E v1 durante migração |
+| Fragmentação | Desabilitada no perfil BP inicial; segmentação resumível do CLA até ADR-013 |
+| Delivery status | Status Reports mantêm semântica BP; receipts OpenMesh seguem ADR-006 e são rate-limited |
+| Integridade/confidencialidade | BPSec como base; integração assimétrica bloqueada enquanto ADR-011 for `Experimental`; E2E v1 só na migração legado |
 | ID OpenMesh | Bundle identity normativa + extension/app ID de 256 bits quando necessário |
 | Copy budget | Extension block OpenMesh opcional e autenticado, ou estado local quando não precisar viajar |
 
@@ -803,7 +805,8 @@ A migração é **strangler**, não rewrite. Cada PR preserva `main` compilável
 
 Gates obrigatórios:
 
-- nenhuma estrutura é implementada antes de aceitar ADR-001 a ADR-006 e ADR-011;
+- ADR-001 a ADR-006 foram aceitas, mas nenhum PR estrutural está autorizado por esta rodada documental;
+- ADR-011 `Experimental` bloqueia identity/writer v2 de produção, não a correção de vocabulário, contracts, store ou extração de adapters após revisão humana;
 - o caminho v1 continua sendo teste de regressão até o dual-stack estar validado;
 - toda nova semântica de “accepted/delivered” tem teste de crash/restart;
 - todo adapter passa uma contract test suite comum e testes de limites;
@@ -817,7 +820,7 @@ Gates obrigatórios:
 | R1: “entregue” falso causa perda percebida | Alta | Crítico | corrigir vocabulário já; implementar next-hop durable e final receipts |
 | R2: flooding/reassembly esgota bateria ou memória | Alta | Crítico | quotas, parsing incremental, copy budget, benchmarks adversariais |
 | R3: um protocolo v2 proprietário diverge de DTN | Alta | Alto | ADR BPv7 + spike de interop antes do wire v2 |
-| R4: overhead BPv7/BPSec é excessivo no BLE | Média | Alto | medir bundles 64 B–1 MiB, compressão de contexto e segmentação; decidir por dados |
+| R4: objetos seguros pequenos amplificam frames no BLE atual | Alta no MTU 23 | Alto | spike mediu 7 bytes úteis/frame; medir MTU, batching, segmentação/resume, airtime e energia em aparelhos |
 | R5: Android impede participação contínua confiável | Alta | Alto | matriz API/OEM, reboot/Doze/permission tests e modos degradados honestos |
 | R6: migração de identidade quebra continuidade | Média | Crítico | root/delegation ADR, dual credentials e vetores de rotação |
 | R7: metadata expõe relações sociais/localização | Alta | Alto | minimização, threat modeling por use case e opção de receipts reduzidos |
@@ -834,30 +837,30 @@ O risco principal de arquitetura é tentar ser “universal” cedo demais. O SP
 
 ## 30. ADRs necessários
 
-| ADR | Decisão | Bloqueia |
-|---|---|---|
-| ADR-001 | BPv7 profile versus protocolo OpenMesh v2 próprio | Qualquer novo wire format |
-| ADR-002 | `EndpointId` versus `NodeId` versus `TransportAddress` | API universal e gateways |
-| ADR-003 | Bytes imutáveis, blocks mutáveis e policy sidecar | Store e assinatura |
-| ADR-004 | SPI de CLA/`TransportAdapter` e semântica de `Opportunity` | Extração de BLE/Wi-Fi |
-| ADR-005 | Modelo transacional do `DeliveryStore` e retention constraints | ACK, recovery e dedup |
-| ADR-006 | Taxonomia de ACK/status/final receipt | Eventos, UI e retries |
-| ADR-007 | `DeliveryId`, tombstones e reconciliação | Anti-replay e anti-entropy |
-| ADR-008 | Routing default e copy budget | Planner v2 |
-| ADR-009 | Capability provenance, confidence e expiry | Seleção multi-transporte |
-| ADR-010 | Energy/congestion/admission policy | Background operation |
-| ADR-011 | Identity root, tamanho do ID, algoritmos, KDF e key separation | Segurança v2 |
-| ADR-012 | Rotação, revogação e continuidade de identidade | Operação de longo prazo |
-| ADR-013 | Fragmentação BP versus segmentação de CLA e resume | Objetos grandes |
-| ADR-014 | Dual-stack, encapsulamento v1 e downgrade resistance | Rollout v2 |
-| ADR-015 | Lifecycle Android multi-adapter e ownership do service | Runtime |
-| ADR-016 | Metadata privacy e política de receipts | Deployments sensíveis |
-| ADR-017 | Registry de extension blocks/capabilities | Extensibilidade futura |
-| ADR-018 | Contract tests, fuzzing, simulator e device matrix | Critério de qualidade |
-| ADR-019 | Gateway reachability e trust | Internet/satélite |
-| ADR-020 | Custody/acceptance transfer, se realmente necessário | Remoção segura de cópias |
+| ADR | Status | Decisão | Bloqueia |
+|---|---|---|---|
+| [ADR-001](adr/ADR-001-bpv7-wire-baseline.md) | `Accepted` | BPv7 profile versus protocolo OpenMesh v2 próprio | Qualquer novo wire format |
+| [ADR-002](adr/ADR-002-identifier-taxonomy.md) | `Accepted` | `EndpointId` versus `NodeId` versus `TransportAddress` | API universal e gateways |
+| [ADR-003](adr/ADR-003-delivery-object-anatomy.md) | `Accepted` | Bytes imutáveis, blocks mutáveis e policy sidecar | Store e assinatura |
+| [ADR-004](adr/ADR-004-transport-spi-opportunity.md) | `Accepted` | SPI de CLA/`TransportAdapter` e semântica de `Opportunity` | Extração de BLE/Wi-Fi |
+| [ADR-005](adr/ADR-005-transactional-delivery-store.md) | `Accepted` | Modelo transacional do `DeliveryStore` e retention constraints | ACK, recovery e dedup |
+| [ADR-006](adr/ADR-006-receipt-taxonomy.md) | `Accepted` | Taxonomia de ACK/status/final receipt | Eventos, UI e retries |
+| ADR-007 | Proposta | `DeliveryId`, tombstones e reconciliação | Anti-replay e anti-entropy |
+| ADR-008 | Proposta | Routing default e copy budget | Planner v2 |
+| ADR-009 | Proposta | Capability provenance, confidence e expiry | Seleção multi-transporte |
+| ADR-010 | Proposta | Energy/congestion/admission policy | Background operation |
+| [ADR-011](adr/ADR-011-identity-v2.md) | `Experimental` | Identity root, tamanho do ID, algoritmos, KDF e key separation | Segurança/writer v2 de produção |
+| ADR-012 | Proposta | Rotação, revogação e continuidade de identidade | Operação de longo prazo |
+| ADR-013 | Proposta | Fragmentação BP versus segmentação de CLA e resume | Objetos grandes |
+| ADR-014 | Proposta | Dual-stack, encapsulamento v1 e downgrade resistance | Rollout v2 |
+| ADR-015 | Proposta | Lifecycle Android multi-adapter e ownership do service | Runtime |
+| ADR-016 | Proposta | Metadata privacy e política de receipts | Deployments sensíveis |
+| ADR-017 | Proposta | Registry de extension blocks/capabilities | Extensibilidade futura |
+| ADR-018 | Proposta | Contract tests, fuzzing, simulator e device matrix | Critério de qualidade |
+| ADR-019 | Proposta | Gateway reachability e trust | Internet/satélite |
+| ADR-020 | Proposta | Custody/acceptance transfer, se realmente necessário | Remoção segura de cópias |
 
-ADRs 001–006 e 011 são o conjunto mínimo antes de alteração estrutural. ADR-020 pode terminar em “não implementar”; isso é uma decisão válida.
+ADRs 001–006 fixam os limites necessários aos primeiros PRs estruturais após revisão humana. ADR-011 permanece experimental e bloqueia identity/writer v2 de produção. ADR-020 pode terminar em “não implementar”; isso é uma decisão válida.
 
 ---
 
@@ -919,6 +922,8 @@ Todos os links abaixo estão fixados no SHA auditado.
 ## Sequência de implementação em PRs pequenos
 
 Cada passo termina com CI verde, fixtures v1 intactas e uma mudança observável isolada.
+
+> A [revisão pós-ADR](OPENMESH_ARCHITECTURE_V1_ADR_DELTA.md#sequência-incremental-revisada) refina esta sequência, separa tipos/estado antes da extração e adiciona gates read-only/interoperabilidade para BPv7. O item 1 abaixo foi concluído documentalmente; nenhum item seguinte foi autorizado nesta rodada.
 
 1. **ADR/conformance spike, sem runtime:** decidir ADR-001–006/011; criar bundles BPv7 de referência e medir overhead BLE. Saída: documentos, test vectors e decisão go/no-go.
 2. **Baseline reproduzível:** adicionar Gradle Wrapper, golden vectors v1, testes de malformed/trailing/oversize, race de ingestão e estado no hop limit. Nenhuma mudança de wire.
