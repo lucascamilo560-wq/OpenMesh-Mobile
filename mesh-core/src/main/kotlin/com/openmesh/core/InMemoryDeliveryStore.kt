@@ -175,12 +175,12 @@ internal class InMemoryDeliveryStore(
         }
         if (busy != null) {
             val next = if (changed) original.copy(attempts = attempts) else original
-            return@commit Mutation(
-                state = next,
-                value = TransferReservationResult.Busy(busy),
-                events = emptyList(),
-                changed = changed,
-            )
+            val value = TransferReservationResult.Busy(busy)
+            return@commit if (changed) {
+                Mutation.changed(state = next, value = value)
+            } else {
+                Mutation.unchanged(value)
+            }
         }
 
         val attemptCount = attempts.values.count { it.deliveryId == reservation.deliveryId }
@@ -616,9 +616,9 @@ internal class InMemoryDeliveryStore(
         mutation: (State) -> Mutation<T>,
     ): T = mutex.withLock {
         val result = mutation(state)
-        if (result.changed) {
+        result.state?.let { committedState ->
             beforeCommit(kind)
-            state = result.state
+            state = committedState
             result.events.forEach { mutablePostCommitEvents.tryEmit(it) }
         }
         result.value
@@ -658,7 +658,7 @@ internal class InMemoryDeliveryStore(
         )
     }
 
-    internal data class Checkpoint internal constructor(internal val state: State)
+    internal class Checkpoint internal constructor(internal val state: State)
 
     internal enum class CommitKind {
         INGEST,
@@ -717,24 +717,22 @@ internal class InMemoryDeliveryStore(
     }
 
     private data class Mutation<T>(
-        val state: State,
+        val state: State?,
         val value: T,
         val events: List<OutboxRecord>,
-        val changed: Boolean,
     ) {
         companion object {
             fun <T> unchanged(value: T): Mutation<T> = Mutation(
-                state = State(),
+                state = null,
                 value = value,
                 events = emptyList(),
-                changed = false,
             )
 
             fun <T> changed(
                 state: State,
                 value: T,
                 events: List<OutboxRecord> = emptyList(),
-            ): Mutation<T> = Mutation(state, value, events, changed = true)
+            ): Mutation<T> = Mutation(state, value, events)
         }
     }
 

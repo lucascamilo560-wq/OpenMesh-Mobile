@@ -398,11 +398,11 @@ class DeliveryStoreConformanceTest {
     private suspend fun <T : Throwable> expectSuspendThrows(
         type: Class<T>,
         block: suspend () -> Unit,
-    ): T {
+    ) {
         try {
             block()
         } catch (thrown: Throwable) {
-            if (type.isInstance(thrown)) return type.cast(thrown)
+            if (type.isInstance(thrown)) return
             throw AssertionError("Expected ${type.name}, got ${thrown::class.java.name}", thrown)
         }
         throw AssertionError("Expected ${type.name} to be thrown")
