@@ -3,11 +3,14 @@ package com.openmesh.core
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class MeshRouter(
     private val localNodeId: String,
     private val store: PacketStore,
 ) {
+    private val ingestMutex = Mutex()
     private val _deliveries = MutableSharedFlow<MeshEnvelope>(extraBufferCapacity = 64)
     val deliveries: SharedFlow<MeshEnvelope> = _deliveries.asSharedFlow()
 
@@ -28,28 +31,30 @@ class MeshRouter(
         if (packet.isExpired(nowMs)) {
             return IngestResult.REJECTED_EXPIRED
         }
-        if (store.contains(packet.packetId)) {
-            return IngestResult.DUPLICATE
-        }
 
         val addressedToLocal = packet.destinationNodeId == localNodeId
         val broadcast = packet.destinationNodeId == null
+        val result = ingestMutex.withLock {
+            if (store.contains(packet.packetId)) {
+                return@withLock IngestResult.DUPLICATE
+            }
 
-        if (addressedToLocal || broadcast) {
+            // Record every non-rejected v1 packet, including packets at their hop limit.
+            // Forwardability is evaluated separately by nextBatchForPeer(); retaining
+            // the record prevents repeated final/broadcast delivery of the same ID.
+            store.put(packet)
+
+            when {
+                addressedToLocal -> IngestResult.DELIVERED_LOCAL
+                broadcast -> IngestResult.DELIVERED_BROADCAST
+                else -> IngestResult.STORED_FOR_FORWARDING
+            }
+        }
+
+        if (result == IngestResult.DELIVERED_LOCAL || result == IngestResult.DELIVERED_BROADCAST) {
             _deliveries.emit(packet)
         }
-
-        // Keep a record even after final delivery so duplicates are suppressed.
-        // nextBatchForPeer() prevents final-destination packets from being re-forwarded.
-        if (packet.canForward(nowMs)) {
-            store.put(packet)
-        }
-
-        return when {
-            addressedToLocal -> IngestResult.DELIVERED_LOCAL
-            broadcast -> IngestResult.DELIVERED_BROADCAST
-            else -> IngestResult.STORED_FOR_FORWARDING
-        }
+        return result
     }
 
     suspend fun nextBatchForPeer(

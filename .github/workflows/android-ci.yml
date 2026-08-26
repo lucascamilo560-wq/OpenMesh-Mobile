@@ -24,13 +24,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle 9.5
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.5.0'
 
       - name: Build and test
-        run: gradle :mesh-core:testDebugUnitTest :mesh-android:testDebugUnitTest :mesh-android:assembleDebug :app:assembleDebug --stacktrace
+        run: ./gradlew :mesh-core:testDebugUnitTest :mesh-android:testDebugUnitTest :mesh-android:assembleDebug :app:assembleDebug --stacktrace
 
       - name: Publish functional test APK
         if: success()
