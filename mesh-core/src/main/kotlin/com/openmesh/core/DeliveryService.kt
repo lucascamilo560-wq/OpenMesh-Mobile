@@ -114,6 +114,6 @@ fun interface DeliveryService {
     suspend fun deliver(
         destination: EndpointId,
         payload: ByteArray,
-        policy: DeliveryPolicy = DeliveryPolicy(),
+        policy: DeliveryPolicy,
     ): DeliveryHandle
 }
