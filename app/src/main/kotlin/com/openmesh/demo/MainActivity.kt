@@ -20,6 +20,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import com.openmesh.android.AndroidMeshIdentityStore
 import com.openmesh.android.BleMeshNode
+import com.openmesh.android.LegacyV1DeliveryService
+import com.openmesh.android.LegacyV1EndpointBridge
 import com.openmesh.android.MeshNodeService
 import com.openmesh.android.MeshRadioGuard
 import com.openmesh.android.VerifiedPeerMetadata
@@ -28,6 +30,8 @@ import com.openmesh.android.WifiDirectSocketSession
 import com.openmesh.android.WifiDirectUpgradeCoordinator
 import com.openmesh.android.WifiDirectUpgradeEvent
 import com.openmesh.android.WifiDirectUpgradeResult
+import com.openmesh.core.DeliveryPolicy
+import com.openmesh.core.DeliveryService
 import com.openmesh.core.SecureMeshMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +53,7 @@ class MainActivity : Activity() {
     private lateinit var wifiGuard: WifiDirectRadioGuard
 
     private var node: BleMeshNode? = null
+    private var deliveryService: DeliveryService? = null
     private var bound = false
     private var deliveryJob: Job? = null
     private var peerRefreshJob: Job? = null
@@ -68,7 +73,17 @@ class MainActivity : Activity() {
             bound = true
             val binder = service as? MeshNodeService.LocalBinder
             node = binder?.node()
-            if (node != null) {
+            val activeNode = node
+            if (activeNode != null) {
+                deliveryService = LegacyV1DeliveryService(
+                    node = activeNode,
+                    senderIdentity = identity,
+                    resolveEndpoint = { endpoint ->
+                        selectedPeer
+                            ?.let(LegacyV1EndpointBridge::bind)
+                            ?.takeIf { it.endpointId == endpoint }
+                    },
+                )
                 setStatus("Mesh ativa. Procurando outros nós…")
                 observeDeliveries()
                 observeVerifiedPeers()
@@ -80,6 +95,7 @@ class MainActivity : Activity() {
 
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
+            deliveryService = null
             node = null
             stopObservers()
             closeUpgradeCoordinator()
@@ -204,6 +220,7 @@ class MainActivity : Activity() {
     private fun stopMesh() {
         stopObservers()
         closeUpgradeCoordinator()
+        deliveryService = null
         node = null
         selectedPeer = null
         updatePeerLabel()
@@ -247,24 +264,30 @@ class MainActivity : Activity() {
     }
 
     private fun sendSecureTestMessage() {
-        val activeNode = node ?: return setStatus("Ative a mesh antes de enviar")
+        val deliveries = deliveryService ?: return setStatus("Ative a mesh antes de enviar")
         val peer = selectedPeer ?: return setStatus("Nenhum peer verificado. Ative o app no segundo celular e mantenha-os próximos.")
         val text = messageInput.text?.toString()?.ifBlank { "Olá pela OpenMesh" } ?: "Olá pela OpenMesh"
+        val destination = runCatching { LegacyV1EndpointBridge.bind(peer).endpointId }
+            .getOrElse {
+                setStatus("Endpoint legado inválido: ${it.message}")
+                return
+            }
 
         scope.launch {
-            val envelope = runCatching {
-                activeNode.sendSecure(
+            val handle = runCatching {
+                deliveries.deliver(
+                    destination = destination,
                     payload = text.encodeToByteArray(),
-                    contentType = TEST_MESSAGE_CONTENT_TYPE,
-                    senderIdentity = identity,
-                    recipientNodeId = peer.nodeId,
-                    recipientPublicKeyBase64 = peer.publicKeyBase64,
+                    policy = DeliveryPolicy(contentType = TEST_MESSAGE_CONTENT_TYPE),
                 )
             }.getOrElse {
                 setStatus("Falha ao enfileirar mensagem segura: ${it.message}")
                 return@launch
             }
-            setStatus("Mensagem segura ${envelope.packetId.take(8)} enfileirada para ${shortId(peer.nodeId)}")
+            setStatus(
+                "Intenção ${handle.requestId.value.take(8)} armazenada localmente; " +
+                    "entrega a ${destination.value} não confirmada"
+            )
         }
     }
 
