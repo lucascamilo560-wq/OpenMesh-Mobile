@@ -244,9 +244,9 @@ class DeliveryStoreConformanceTest {
     }
 
     @Test
-    fun `transfer lifecycle is independent and next hop acceptance is not delivery`() = runBlocking {
+    fun `link write alone never creates durable next hop acceptance`() = runBlocking {
         val store = InMemoryDeliveryStore()
-        val delivery = deliveryObject(id = "delivery-next-hop")
+        val delivery = deliveryObject(id = "delivery-link-only")
         store.ingest(ingest(delivery), nowMs = 100)
         val reserved = store.reserveTransfer(
             TransferReservation(
@@ -265,15 +265,149 @@ class DeliveryStoreConformanceTest {
             duringTransfer.transferAttempts.single().state,
         )
         store.recordLinkWriteCompleted(reserved.lease, nowMs = 130)
-        store.recordNextHopAccepted(reserved.lease, nowMs = 140)
 
-        val accepted = store.snapshot(delivery.deliveryId)
-        assertEquals(DeliveryState.WAITING, accepted.deliveryRecord?.state)
+        val linkOnly = store.snapshot(delivery.deliveryId)
+        assertEquals(DeliveryState.WAITING, linkOnly.deliveryRecord?.state)
         assertEquals(
-            TransferAttemptState.NEXT_HOP_ACCEPTED,
-            accepted.transferAttempts.single().state,
+            TransferAttemptState.LINK_WRITE_COMPLETED,
+            linkOnly.transferAttempts.single().state,
         )
-        assertFalse(accepted.deliveryRecord?.state == DeliveryState.APP_DELIVERED)
+        assertTrue(linkOnly.nextHopAcceptances.isEmpty())
+        assertFalse(
+            store.listOutbox().any {
+                it.event is DeliveryStoreEvent.NextHopAcceptedDurably
+            }
+        )
+    }
+
+    @Test
+    fun `untrusted receipts never create durable next hop acceptance`() = runBlocking {
+        val store = InMemoryDeliveryStore()
+        val delivery = deliveryObject(id = "delivery-untrusted-receipts")
+        store.ingest(ingest(delivery), nowMs = 100)
+        val reserved = store.reserveTransfer(
+            TransferReservation(
+                deliveryId = delivery.deliveryId,
+                context = transferContext(),
+                leaseDurationMs = 1_000,
+            ),
+            nowMs = 110,
+        ) as TransferReservationResult.Acquired
+        store.markTransferStarted(reserved.lease, nowMs = 120)
+        store.recordLinkWriteCompleted(reserved.lease, nowMs = 130)
+
+        listOf(
+            ReceiptVerification.UNVERIFIED,
+            ReceiptVerification.INVALID,
+            ReceiptVerification.AUTHENTICATED,
+        ).forEachIndexed { index, verification ->
+            val receipt = ReceiptInput.copyOf(
+                receiptId = ReceiptId("untrusted-receipt-$index"),
+                deliveryId = delivery.deliveryId,
+                evidence = ReceiptEvidence.NEXT_HOP_ACCEPTED_DURABLY,
+                issuer = "claimed-next-hop",
+                verification = verification,
+                protectedBytes = byteArrayOf(index.toByte()),
+                linkedTransferAttemptId = reserved.attempt.attemptId,
+            )
+            val result = store.recordReceipt(receipt, nowMs = 140L + index)
+            assertTrue(result is ReceiptWriteResult.Stored)
+            assertNull(result.record.appliedAtMs)
+        }
+
+        val snapshot = store.snapshot(delivery.deliveryId)
+        assertEquals(
+            TransferAttemptState.LINK_WRITE_COMPLETED,
+            snapshot.transferAttempts.single().state,
+        )
+        assertTrue(snapshot.nextHopAcceptances.isEmpty())
+    }
+
+    @Test
+    fun `authenticated and authorized receipt creates durable next hop acceptance`() =
+        runBlocking {
+            val store = InMemoryDeliveryStore()
+            val delivery = deliveryObject(id = "delivery-authorized-receipt")
+            store.ingest(ingest(delivery), nowMs = 100)
+            val reserved = store.reserveTransfer(
+                TransferReservation(
+                    deliveryId = delivery.deliveryId,
+                    context = transferContext(),
+                    leaseDurationMs = 1_000,
+                ),
+                nowMs = 110,
+            ) as TransferReservationResult.Acquired
+            store.markTransferStarted(reserved.lease, nowMs = 120)
+            store.recordLinkWriteCompleted(reserved.lease, nowMs = 130)
+            val receipt = ReceiptInput.copyOf(
+                receiptId = ReceiptId("authorized-next-hop-receipt"),
+                deliveryId = delivery.deliveryId,
+                evidence = ReceiptEvidence.NEXT_HOP_ACCEPTED_DURABLY,
+                issuer = "authenticated-next-hop",
+                verification = ReceiptVerification.AUTHENTICATED_AND_AUTHORIZED,
+                protectedBytes = byteArrayOf(1, 2, 3),
+                linkedTransferAttemptId = reserved.attempt.attemptId,
+            )
+            val acceptance = VerifiedNextHopAcceptance.fromAuthenticatedReceipt(receipt)
+
+            val first = store.recordNextHopAcceptedDurably(acceptance, nowMs = 140)
+            val duplicate = store.recordNextHopAcceptedDurably(acceptance, nowMs = 141)
+
+            assertTrue(first is NextHopAcceptanceWriteResult.Stored)
+            assertTrue(duplicate is NextHopAcceptanceWriteResult.Duplicate)
+            val snapshot = store.snapshot(delivery.deliveryId)
+            assertEquals(
+                TransferAttemptState.NEXT_HOP_ACCEPTED_DURABLY,
+                snapshot.transferAttempts.single().state,
+            )
+            assertEquals(1, snapshot.nextHopAcceptances.size)
+            assertEquals(1, snapshot.receipts.size)
+            assertEquals(140L, snapshot.receipts.single().appliedAtMs)
+            assertEquals(
+                1,
+                store.listOutbox().count {
+                    it.event is DeliveryStoreEvent.NextHopAcceptedDurably
+                },
+            )
+        }
+
+    @Test
+    fun `authenticated session acceptance leaves delivery waiting`() = runBlocking {
+        val store = InMemoryDeliveryStore()
+        val delivery = deliveryObject(id = "delivery-session-acceptance")
+        store.ingest(ingest(delivery), nowMs = 100)
+        val reserved = store.reserveTransfer(
+            TransferReservation(
+                deliveryId = delivery.deliveryId,
+                context = transferContext(),
+                leaseDurationMs = 1_000,
+            ),
+            nowMs = 110,
+        ) as TransferReservationResult.Acquired
+        store.markTransferStarted(reserved.lease, nowMs = 120)
+        store.recordLinkWriteCompleted(reserved.lease, nowMs = 130)
+        val acceptance = VerifiedNextHopAcceptance.fromAuthenticatedSession(
+            deliveryId = delivery.deliveryId,
+            transferAttemptId = reserved.attempt.attemptId,
+            evidenceId = AcceptanceEvidenceId("session-transcript-1"),
+            authority = "authenticated-session-peer",
+            protectedBytes = byteArrayOf(4, 5, 6),
+        )
+
+        store.recordNextHopAcceptedDurably(acceptance, nowMs = 140)
+
+        val snapshot = store.snapshot(delivery.deliveryId)
+        assertEquals(DeliveryState.WAITING, snapshot.deliveryRecord?.state)
+        assertEquals(
+            TransferAttemptState.NEXT_HOP_ACCEPTED_DURABLY,
+            snapshot.transferAttempts.single().state,
+        )
+        assertEquals(
+            NextHopAcceptanceEvidenceKind.AUTHENTICATED_SESSION,
+            snapshot.nextHopAcceptances.single().kind,
+        )
+        assertTrue(snapshot.receipts.isEmpty())
+        assertFalse(snapshot.deliveryRecord?.state == DeliveryState.APP_DELIVERED)
     }
 
     @Test

@@ -246,25 +246,6 @@ internal class InMemoryDeliveryStore(
         )
     }
 
-    override suspend fun recordNextHopAccepted(
-        lease: TransferLease,
-        nowMs: Long,
-    ): TransferAttempt = updateAttempt(
-        kind = CommitKind.UPDATE_TRANSFER,
-        lease = lease,
-        nowMs = nowMs,
-        permittedStates = setOf(
-            TransferAttemptState.TRANSFERRING,
-            TransferAttemptState.LINK_WRITE_COMPLETED,
-        ),
-    ) { attempt ->
-        attempt.copy(
-            state = TransferAttemptState.NEXT_HOP_ACCEPTED,
-            nextHopAcceptedAtMs = nowMs,
-            finishedAtMs = nowMs,
-        )
-    }
-
     override suspend fun recordTransferFailure(
         lease: TransferLease,
         reason: String,
@@ -283,6 +264,145 @@ internal class InMemoryDeliveryStore(
                 failureReason = reason,
             )
         }
+    }
+
+    override suspend fun recordNextHopAcceptedDurably(
+        acceptance: VerifiedNextHopAcceptance,
+        nowMs: Long,
+    ): NextHopAcceptanceWriteResult = commit(
+        CommitKind.RECORD_NEXT_HOP_ACCEPTANCE
+    ) { original ->
+        if (!original.records.containsKey(acceptance.deliveryId)) {
+            throw InvalidDeliveryTransitionException(
+                "Cannot accept unknown delivery ${acceptance.deliveryId}"
+            )
+        }
+        val attempt = original.attempts[acceptance.transferAttemptId]
+            ?: throw InvalidDeliveryTransitionException(
+                "Acceptance references unknown transfer attempt " +
+                    acceptance.transferAttemptId
+            )
+        if (attempt.deliveryId != acceptance.deliveryId) {
+            throw InvalidDeliveryTransitionException(
+                "Acceptance and transfer attempt belong to different deliveries"
+            )
+        }
+        if (acceptance.protectedBytes.size > limits.maxAcceptanceEvidenceBytes) {
+            throw DeliveryStoreAdmissionException(
+                "Acceptance evidence exceeds ${limits.maxAcceptanceEvidenceBytes} bytes"
+            )
+        }
+
+        val existingAcceptance = original.acceptances[acceptance.evidenceId]
+        if (existingAcceptance != null) {
+            if (!existingAcceptance.matches(acceptance)) {
+                throw AcceptanceEvidenceIdentityConflictException(acceptance.evidenceId)
+            }
+            return@commit Mutation.unchanged(
+                NextHopAcceptanceWriteResult.Duplicate(existingAcceptance, attempt)
+            )
+        }
+        val acceptanceCount = original.acceptances.values.count {
+            it.deliveryId == acceptance.deliveryId
+        }
+        if (acceptanceCount >= limits.maxAcceptancesPerDelivery) {
+            throw DeliveryStoreAdmissionException(
+                "Next-hop acceptance evidence limit reached for ${acceptance.deliveryId}"
+            )
+        }
+        if (
+            attempt.state != TransferAttemptState.NEXT_HOP_ACCEPTED_DURABLY &&
+            attempt.startedAtMs == null
+        ) {
+            throw InvalidDeliveryTransitionException(
+                "Transfer ${attempt.attemptId} never entered TRANSFERRING"
+            )
+        }
+
+        var receipts = original.receipts
+        var receiptWasNew = false
+        acceptance.receipt?.let { receipt ->
+            check(receipt.deliveryId == acceptance.deliveryId)
+            check(receipt.linkedTransferAttemptId == acceptance.transferAttemptId)
+            if (receipt.protectedBytes.size > limits.maxReceiptBytes) {
+                throw DeliveryStoreAdmissionException(
+                    "Receipt exceeds ${limits.maxReceiptBytes} bytes"
+                )
+            }
+            val existingReceipt = receipts[receipt.receiptId]
+            if (existingReceipt != null && existingReceipt.receipt != receipt) {
+                throw ReceiptIdentityConflictException(receipt.receiptId)
+            }
+            if (existingReceipt == null) {
+                val receiptCount = receipts.values.count {
+                    it.receipt.deliveryId == receipt.deliveryId
+                }
+                if (receiptCount >= limits.maxReceiptsPerDelivery) {
+                    throw DeliveryStoreAdmissionException(
+                        "Receipt limit reached for ${receipt.deliveryId}"
+                    )
+                }
+                receiptWasNew = true
+            }
+            val appliedReceipt = existingReceipt?.copy(
+                appliedAtMs = existingReceipt.appliedAtMs ?: nowMs,
+            ) ?: ReceiptRecord(
+                receipt = receipt,
+                storedAtMs = nowMs,
+                appliedAtMs = nowMs,
+            )
+            receipts = receipts + (receipt.receiptId to appliedReceipt)
+        }
+
+        val evidenceRecord = NextHopAcceptanceRecord(
+            deliveryId = acceptance.deliveryId,
+            transferAttemptId = acceptance.transferAttemptId,
+            evidenceId = acceptance.evidenceId,
+            authority = acceptance.authority,
+            kind = acceptance.kind,
+            protectedBytes = acceptance.protectedBytes,
+            receiptId = acceptance.receipt?.receiptId,
+            storedAtMs = nowMs,
+        )
+        val acceptedAttempt = attempt.copy(
+            state = TransferAttemptState.NEXT_HOP_ACCEPTED_DURABLY,
+            nextHopAcceptedDurablyAtMs = attempt.nextHopAcceptedDurablyAtMs ?: nowMs,
+            nextHopAcceptanceEvidenceId =
+                attempt.nextHopAcceptanceEvidenceId ?: acceptance.evidenceId,
+            finishedAtMs = nowMs,
+            failureReason = null,
+        )
+        val next = original.copy(
+            attempts = original.attempts + (attempt.attemptId to acceptedAttempt),
+            acceptances = original.acceptances + (acceptance.evidenceId to evidenceRecord),
+            receipts = receipts,
+        )
+        val events = buildList {
+            if (receiptWasNew) {
+                add(
+                    DeliveryStoreEvent.ReceiptRecorded(
+                        deliveryId = acceptance.deliveryId,
+                        receiptId = checkNotNull(acceptance.receipt).receiptId,
+                    )
+                )
+            }
+            add(
+                DeliveryStoreEvent.NextHopAcceptedDurably(
+                    deliveryId = acceptance.deliveryId,
+                    transferAttemptId = acceptance.transferAttemptId,
+                    evidenceId = acceptance.evidenceId,
+                )
+            )
+        }
+        val appended = appendOutbox(next, events, nowMs)
+        Mutation.changed(
+            state = appended.state,
+            value = NextHopAcceptanceWriteResult.Stored(
+                record = evidenceRecord,
+                attempt = acceptedAttempt,
+            ),
+            events = appended.records,
+        )
     }
 
     override suspend fun recordReceipt(
@@ -329,32 +449,17 @@ internal class InMemoryDeliveryStore(
 
         val authorized = receipt.verification ==
             ReceiptVerification.AUTHENTICATED_AND_AUTHORIZED
+        val appliesToDelivery = authorized && receipt.evidence == ReceiptEvidence.APP_DELIVERED
         val stored = ReceiptRecord(
             receipt = receipt,
             storedAtMs = nowMs,
-            appliedAtMs = nowMs.takeIf { authorized },
+            appliedAtMs = nowMs.takeIf { appliesToDelivery },
         )
         var next = original.copy(
             receipts = original.receipts + (receipt.receiptId to stored),
         )
 
-        if (
-            authorized &&
-            receipt.evidence == ReceiptEvidence.NEXT_HOP_ACCEPTED_DURABLY &&
-            linkedAttempt != null
-        ) {
-            next = next.copy(
-                attempts = next.attempts + (
-                    linkedAttempt.attemptId to linkedAttempt.copy(
-                        state = TransferAttemptState.NEXT_HOP_ACCEPTED,
-                        nextHopAcceptedAtMs = nowMs,
-                        finishedAtMs = nowMs,
-                    )
-                )
-            )
-        }
-
-        if (authorized && receipt.evidence == ReceiptEvidence.APP_DELIVERED) {
+        if (appliesToDelivery) {
             next = next.copy(
                 records = next.records + (
                     receipt.deliveryId to deliveryRecord.copy(
@@ -664,6 +769,7 @@ internal class InMemoryDeliveryStore(
         INGEST,
         RESERVE_TRANSFER,
         UPDATE_TRANSFER,
+        RECORD_NEXT_HOP_ACCEPTANCE,
         RECORD_RECEIPT,
         ACKNOWLEDGE_APPLICATION,
         EXPIRE,
@@ -677,6 +783,7 @@ internal class InMemoryDeliveryStore(
         val records: Map<DeliveryId, DeliveryRecord> = emptyMap(),
         val attempts: Map<TransferAttemptId, TransferAttempt> = emptyMap(),
         val leaseOwners: Map<TransferAttemptId, String> = emptyMap(),
+        val acceptances: Map<AcceptanceEvidenceId, NextHopAcceptanceRecord> = emptyMap(),
         val receipts: Map<ReceiptId, ReceiptRecord> = emptyMap(),
         val inbox: Map<DeliveryId, InboxRecord> = emptyMap(),
         val outbox: List<OutboxRecord> = emptyList(),
@@ -690,6 +797,9 @@ internal class InMemoryDeliveryStore(
             transferAttempts = attempts.values
                 .filter { it.deliveryId == deliveryId }
                 .sortedBy { it.attemptId.value },
+            nextHopAcceptances = acceptances.values
+                .filter { it.deliveryId == deliveryId }
+                .sortedBy { it.evidenceId.value },
             receipts = receipts.values
                 .filter { it.receipt.deliveryId == deliveryId }
                 .sortedBy { it.receipt.receiptId.value },
@@ -704,11 +814,15 @@ internal class InMemoryDeliveryStore(
             val removedReceiptIds = receipts.values
                 .filter { it.receipt.deliveryId == deliveryId }
                 .mapTo(mutableSetOf()) { it.receipt.receiptId }
+            val removedAcceptanceIds = acceptances.values
+                .filter { it.deliveryId == deliveryId }
+                .mapTo(mutableSetOf()) { it.evidenceId }
             return copy(
                 objects = objects - deliveryId,
                 records = records - deliveryId,
                 attempts = attempts - removedAttemptIds,
                 leaseOwners = leaseOwners - removedAttemptIds,
+                acceptances = acceptances - removedAcceptanceIds,
                 receipts = receipts - removedReceiptIds,
                 inbox = inbox - deliveryId,
                 tombstones = tombstones - deliveryId,
@@ -770,6 +884,17 @@ private fun safeAdd(value: Long, positiveDuration: Long): Long {
     }
     return value + positiveDuration
 }
+
+private fun NextHopAcceptanceRecord.matches(
+    acceptance: VerifiedNextHopAcceptance,
+): Boolean =
+    deliveryId == acceptance.deliveryId &&
+        transferAttemptId == acceptance.transferAttemptId &&
+        evidenceId == acceptance.evidenceId &&
+        authority == acceptance.authority &&
+        kind == acceptance.kind &&
+        protectedBytes == acceptance.protectedBytes &&
+        receiptId == acceptance.receipt?.receiptId
 
 private fun requireBoundedInternalText(label: String, value: String, maxBytes: Int) {
     require(value.isNotBlank()) { "$label must not be blank" }

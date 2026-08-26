@@ -41,6 +41,15 @@ value class ReceiptId(val value: String) {
 }
 
 @JvmInline
+value class AcceptanceEvidenceId(val value: String) {
+    init {
+        requireBoundedStoreText("Acceptance evidence ID", value, 1_024)
+    }
+
+    override fun toString(): String = value
+}
+
+@JvmInline
 value class OutboxEventId(val value: String) {
     init {
         requireBoundedStoreText("Outbox event ID", value, 256)
@@ -176,7 +185,7 @@ enum class TransferAttemptState {
     RESERVED,
     TRANSFERRING,
     LINK_WRITE_COMPLETED,
-    NEXT_HOP_ACCEPTED,
+    NEXT_HOP_ACCEPTED_DURABLY,
     FAILED,
     LEASE_EXPIRED,
     CANCELLED,
@@ -192,7 +201,8 @@ data class TransferAttempt(
     val leaseExpiresAtMs: Long,
     val startedAtMs: Long? = null,
     val linkWriteCompletedAtMs: Long? = null,
-    val nextHopAcceptedAtMs: Long? = null,
+    val nextHopAcceptedDurablyAtMs: Long? = null,
+    val nextHopAcceptanceEvidenceId: AcceptanceEvidenceId? = null,
     val leaseExpiredAtMs: Long? = null,
     val finishedAtMs: Long? = null,
     val failureReason: String? = null,
@@ -281,6 +291,105 @@ data class ReceiptRecord(
     val appliedAtMs: Long?,
 )
 
+enum class NextHopAcceptanceEvidenceKind {
+    AUTHENTICATED_SESSION,
+    AUTHENTICATED_RECEIPT,
+}
+
+/**
+ * Proof-carrying authority to record next-hop durable acceptance.
+ *
+ * The constructor and factories are internal so transport modules cannot mint
+ * this authority from a link callback or [TransferLease]. A Protocol/Security
+ * Agent may create it only after authenticating the peer/issuer, authorizing it
+ * for this hop, and binding the evidence to the object and transfer attempt.
+ * Cryptographic wire verification remains outside this store contract.
+ */
+class VerifiedNextHopAcceptance private constructor(
+    val deliveryId: DeliveryId,
+    val transferAttemptId: TransferAttemptId,
+    val evidenceId: AcceptanceEvidenceId,
+    val authority: String,
+    val kind: NextHopAcceptanceEvidenceKind,
+    val protectedBytes: OpaqueBytes,
+    internal val receipt: ReceiptInput?,
+) {
+    init {
+        requireBoundedStoreText("Next-hop acceptance authority", authority, 512)
+        require(protectedBytes.size > 0) { "Acceptance evidence bytes must not be empty" }
+    }
+
+    companion object {
+        /** Protocol/Security Agent entry after authenticated session verification. */
+        internal fun fromAuthenticatedSession(
+            deliveryId: DeliveryId,
+            transferAttemptId: TransferAttemptId,
+            evidenceId: AcceptanceEvidenceId,
+            authority: String,
+            protectedBytes: ByteArray,
+        ): VerifiedNextHopAcceptance = VerifiedNextHopAcceptance(
+            deliveryId = deliveryId,
+            transferAttemptId = transferAttemptId,
+            evidenceId = evidenceId,
+            authority = authority,
+            kind = NextHopAcceptanceEvidenceKind.AUTHENTICATED_SESSION,
+            protectedBytes = OpaqueBytes.copyOf(protectedBytes),
+            receipt = null,
+        )
+
+        /** Protocol/Security Agent entry after receipt authentication and authorization. */
+        internal fun fromAuthenticatedReceipt(
+            receipt: ReceiptInput,
+        ): VerifiedNextHopAcceptance {
+            require(receipt.evidence == ReceiptEvidence.NEXT_HOP_ACCEPTED_DURABLY) {
+                "Receipt does not prove next-hop durable acceptance"
+            }
+            require(
+                receipt.verification == ReceiptVerification.AUTHENTICATED_AND_AUTHORIZED
+            ) { "Receipt is not authenticated and authorized for next-hop acceptance" }
+            val attemptId = requireNotNull(receipt.linkedTransferAttemptId) {
+                "Next-hop receipt must identify its transfer attempt"
+            }
+            return VerifiedNextHopAcceptance(
+                deliveryId = receipt.deliveryId,
+                transferAttemptId = attemptId,
+                evidenceId = AcceptanceEvidenceId("receipt:${receipt.receiptId.value}"),
+                authority = receipt.issuer,
+                kind = NextHopAcceptanceEvidenceKind.AUTHENTICATED_RECEIPT,
+                protectedBytes = receipt.protectedBytes,
+                receipt = receipt,
+            )
+        }
+    }
+}
+
+/** Persisted evidence behind one next-hop durable-acceptance fact. */
+data class NextHopAcceptanceRecord(
+    val deliveryId: DeliveryId,
+    val transferAttemptId: TransferAttemptId,
+    val evidenceId: AcceptanceEvidenceId,
+    val authority: String,
+    val kind: NextHopAcceptanceEvidenceKind,
+    val protectedBytes: OpaqueBytes,
+    val receiptId: ReceiptId?,
+    val storedAtMs: Long,
+)
+
+sealed interface NextHopAcceptanceWriteResult {
+    val record: NextHopAcceptanceRecord
+    val attempt: TransferAttempt
+
+    data class Stored(
+        override val record: NextHopAcceptanceRecord,
+        override val attempt: TransferAttempt,
+    ) : NextHopAcceptanceWriteResult
+
+    data class Duplicate(
+        override val record: NextHopAcceptanceRecord,
+        override val attempt: TransferAttempt,
+    ) : NextHopAcceptanceWriteResult
+}
+
 enum class TombstoneReason {
     EXPIRED,
     EXPLICITLY_REMOVED,
@@ -315,6 +424,12 @@ sealed interface DeliveryStoreEvent {
     data class ReceiptRecorded(
         override val deliveryId: DeliveryId,
         val receiptId: ReceiptId,
+    ) : DeliveryStoreEvent
+
+    data class NextHopAcceptedDurably(
+        override val deliveryId: DeliveryId,
+        val transferAttemptId: TransferAttemptId,
+        val evidenceId: AcceptanceEvidenceId,
     ) : DeliveryStoreEvent
 
     data class DeliveryExpired(
@@ -361,6 +476,7 @@ data class DeliverySnapshot(
     val deliveryObject: DeliveryObject?,
     val deliveryRecord: DeliveryRecord?,
     val transferAttempts: List<TransferAttempt>,
+    val nextHopAcceptances: List<NextHopAcceptanceRecord>,
     val receipts: List<ReceiptRecord>,
     val inboxRecord: InboxRecord?,
     val tombstone: Tombstone?,
@@ -372,6 +488,8 @@ data class DeliveryStoreLimits(
     val maxObjectBytes: Int = 16 * 1024 * 1024,
     val maxReceiptBytes: Int = 64 * 1024,
     val maxReceiptsPerDelivery: Int = 256,
+    val maxAcceptanceEvidenceBytes: Int = 64 * 1024,
+    val maxAcceptancesPerDelivery: Int = 256,
     val maxTransferAttemptsPerDelivery: Int = 1_024,
     val maxProvenanceEntriesPerDelivery: Int = 64,
     val maxOutboxRecords: Int = 50_000,
@@ -382,6 +500,8 @@ data class DeliveryStoreLimits(
         require(maxObjectBytes > 0)
         require(maxReceiptBytes > 0)
         require(maxReceiptsPerDelivery > 0)
+        require(maxAcceptanceEvidenceBytes > 0)
+        require(maxAcceptancesPerDelivery > 0)
         require(maxTransferAttemptsPerDelivery > 0)
         require(maxProvenanceEntriesPerDelivery > 0)
         require(maxOutboxRecords > 0)
@@ -412,7 +532,15 @@ interface DeliveryStore {
 
     suspend fun recordLinkWriteCompleted(lease: TransferLease, nowMs: Long): TransferAttempt
 
-    suspend fun recordNextHopAccepted(lease: TransferLease, nowMs: Long): TransferAttempt
+    /**
+     * Records durable acceptance only from Protocol/Security-verified evidence.
+     * A lease, link write, adapter callback, or unauthenticated receipt is never
+     * sufficient authority for this transition.
+     */
+    suspend fun recordNextHopAcceptedDurably(
+        acceptance: VerifiedNextHopAcceptance,
+        nowMs: Long,
+    ): NextHopAcceptanceWriteResult
 
     suspend fun recordTransferFailure(
         lease: TransferLease,
@@ -451,6 +579,10 @@ class CanonicalDeliveryConflictException(deliveryId: DeliveryId) : IllegalStateE
 class ReceiptIdentityConflictException(receiptId: ReceiptId) : IllegalStateException(
     "Receipt identity conflict for $receiptId",
 )
+
+class AcceptanceEvidenceIdentityConflictException(
+    evidenceId: AcceptanceEvidenceId,
+) : IllegalStateException("Acceptance evidence identity conflict for $evidenceId")
 
 class StaleTransferLeaseException(attemptId: TransferAttemptId) : IllegalStateException(
     "Stale or expired lease for transfer attempt $attemptId",
