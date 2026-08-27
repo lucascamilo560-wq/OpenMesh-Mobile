@@ -18,6 +18,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -161,7 +162,7 @@ class BleTransportAdapterTest {
             )
 
             adapter.stop()
-            collector.cancel()
+            collector.cancelAndJoin()
         }
 
     @Test
@@ -216,7 +217,7 @@ class BleTransportAdapterTest {
             assertEquals(expectedIdentity.nodeId, knownPeer.nodeId.value)
 
             adapter.stop()
-            collector.cancel()
+            collector.cancelAndJoin()
         }
 
     @Test
@@ -301,7 +302,7 @@ class BleTransportAdapterTest {
             val afterStop = adapter.transfer(request(current, arbitraryBytes, "stopped"))
                 as TransportTransferResult.FailedLocally
             assertEquals(TransportLocalFailureCode.ADAPTER_STOPPED, afterStop.failure.code)
-            collector.cancel()
+            collector.cancelAndJoin()
         }
 
     @Test
@@ -347,7 +348,7 @@ class BleTransportAdapterTest {
             assertArrayEquals(inboundBytes, knownInbound.bytes.copyToByteArray())
 
             adapter.stop()
-            collector.cancel()
+            collector.cancelAndJoin()
         }
 
     @Test

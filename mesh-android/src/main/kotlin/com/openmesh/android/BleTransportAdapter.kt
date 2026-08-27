@@ -25,8 +25,10 @@ import java.security.SecureRandom
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -162,7 +164,7 @@ class BleTransportAdapter internal constructor(
             Shutdown(scope = scope, unavailableEvents = unavailableEvents)
         }
 
-        shutdown.scope?.cancel()
+        shutdown.scope?.coroutineContext?.get(Job)?.cancelAndJoin()
         runCatching { platform.stopScanning() }
         runCatching { platform.stopAdvertising() }
         runCatching { platform.stopServer() }
