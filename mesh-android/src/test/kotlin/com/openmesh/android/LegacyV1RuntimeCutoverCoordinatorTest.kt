@@ -185,7 +185,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
         val prepared = retry.prepare(nowMs = 101)
         assertEquals(LegacyV1RuntimeOwner.SQLITE, prepared.owner)
         assertEquals(2, prepared.migrationStatus.importedCount)
-        assertEquals(2, prepared.deliveryStore.listOutbox().size)
+        assertTrue(prepared.deliveryStore.listOutbox().isEmpty())
         assertEquals(sourceBefore, legacyContents())
         retry.close()
         crashing.close()
@@ -308,7 +308,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
             assertEquals(sourceBefore, legacyContents())
             val checkpoint = AndroidDeliveryStore(context, databaseName)
             assertEquals(LegacyV1RuntimeOwner.SQLITE, checkpoint.legacyV1RuntimeOwner())
-            assertEquals(1, checkpoint.listOutbox().size)
+            assertTrue(checkpoint.listOutbox().isEmpty())
             checkpoint.close()
             first.close()
             second.close()
@@ -415,6 +415,55 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
                 1_500L,
                 recovered.deliveryStore.snapshot(DeliveryId(packetId)).tombstone?.expiresAtMs,
             )
+            restarted.close()
+        }
+
+    @Test
+    fun `restart settles committed v1 event before its tombstone proof is pruned`() =
+        runBlocking {
+            val legacy = SharedPreferencesPacketStore(context, preferencesName)
+            legacy.put(envelope("legacy-source-byte-exact", REMOTE_NODE_ID, OTHER_NODE_ID))
+            val sourceBefore = legacyContents()
+            val first = coordinator()
+            val prepared = first.prepare(nowMs = 100)
+            assertTrue(prepared.deliveryStore.listOutbox(limit = 10).isEmpty())
+
+            val packetId = "runtime-event-before-settlement-crash"
+            val crashingBridge = LegacyV1DeliveryPacketStore(
+                store = prepared.deliveryStore,
+                localNodeId = LOCAL_NODE_ID,
+                clock = { 100L },
+                tombstoneReplayGuardMs = 1_000,
+                outboxSettlementHooks = LegacyV1OutboxSettlementHooks(
+                    afterMutationCommittedBeforeSettlement = {
+                        throw SimulatedProcessDeath()
+                    }
+                ),
+            )
+            expectSuspendThrows(SimulatedProcessDeath::class.java) {
+                crashingBridge.put(
+                    envelope(packetId, REMOTE_NODE_ID, OTHER_NODE_ID)
+                        .copy(expiresAtMs = 99)
+                )
+            }
+
+            val committedEvent = prepared.deliveryStore.listOutbox(limit = 10).single()
+            assertEquals(DeliveryId(packetId), committedEvent.event.deliveryId)
+            assertNull(committedEvent.acknowledgedAtMs)
+            assertTrue(
+                prepared.deliveryStore.snapshot(DeliveryId(packetId)).tombstone != null
+            )
+            assertEquals(sourceBefore, legacyContents())
+            first.close()
+
+            val restarted = coordinator()
+            val recovered = restarted.prepare(nowMs = 1_100)
+            assertTrue(recovered.deliveryStore.listOutbox(limit = 10).isEmpty())
+            assertNull(
+                recovered.deliveryStore.snapshot(DeliveryId(packetId)).deliveryRecord
+            )
+            assertFalse(recovered.packetStore.contains(packetId))
+            assertEquals(sourceBefore, legacyContents())
             restarted.close()
         }
 

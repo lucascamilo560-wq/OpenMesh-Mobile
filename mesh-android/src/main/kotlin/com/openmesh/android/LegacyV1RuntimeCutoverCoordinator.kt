@@ -137,6 +137,7 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
                     clock = clock,
                     tombstoneReplayGuardMs = tombstoneReplayGuardMs,
                 )
+                packetStore.settleRecognizedV1Outbox(nowMs)
                 packetStore.pruneExpiredTombstones(nowMs)
                 val result = LegacyV1RuntimePreparation(
                     packetStore = packetStore,
