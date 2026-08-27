@@ -63,8 +63,8 @@ import java.security.SecureRandom
 /**
  * SQLite-backed Android implementation of the ratified [DeliveryStore] contract.
  *
- * This class is intentionally not wired into [SharedPreferencesPacketStore] or
- * the BLE runtime yet. PR #13 proves persistence and recovery before cutover.
+ * The compatibility cutover coordinator may prepare a v1 PacketStore view,
+ * but the production BLE service does not select this store until a later PR.
  */
 class AndroidDeliveryStore internal constructor(
     context: Context,
@@ -646,7 +646,21 @@ class AndroidDeliveryStore internal constructor(
         block: (Transaction) -> T,
     ): T = write(CommitKind.LEGACY_MIGRATION, block)
 
+    internal suspend fun <T> readForLegacyV1Runtime(
+        block: (SQLiteDatabase) -> T,
+    ): T = read(block)
+
+    internal suspend fun <T> writeForLegacyV1Runtime(
+        block: (Transaction) -> T,
+    ): T = write(CommitKind.LEGACY_V1_RUNTIME, block)
+
     internal fun ingestForLegacyMigration(
+        transaction: Transaction,
+        ingest: DeliveryIngest,
+        nowMs: Long,
+    ): DeliveryIngestResult = ingest(transaction, ingest, nowMs)
+
+    internal fun ingestForLegacyV1Runtime(
         transaction: Transaction,
         ingest: DeliveryIngest,
         nowMs: Long,
@@ -888,6 +902,7 @@ class AndroidDeliveryStore internal constructor(
         ACKNOWLEDGE_OUTBOX,
         PRUNE_OUTBOX,
         LEGACY_MIGRATION,
+        LEGACY_V1_RUNTIME,
     }
 
     companion object {
