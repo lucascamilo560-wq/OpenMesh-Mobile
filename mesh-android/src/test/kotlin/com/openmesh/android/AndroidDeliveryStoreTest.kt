@@ -9,17 +9,21 @@ import com.openmesh.core.DeliveryIngest
 import com.openmesh.core.DeliveryIngestResult
 import com.openmesh.core.DeliveryObject
 import com.openmesh.core.DeliveryState
+import com.openmesh.core.DeliveryStoreAdmissionException
 import com.openmesh.core.DeliveryStoreEvent
 import com.openmesh.core.DeliveryStoreLimits
 import com.openmesh.core.EndpointId
 import com.openmesh.core.InboxState
 import com.openmesh.core.IngressProvenance
 import com.openmesh.core.NextHopAcceptanceEvidenceKind
+import com.openmesh.core.NextHopAcceptanceWriteResult
 import com.openmesh.core.ReceiptEvidence
 import com.openmesh.core.ReceiptId
+import com.openmesh.core.ReceiptIdentityConflictException
 import com.openmesh.core.ReceiptInput
 import com.openmesh.core.ReceiptVerification
 import com.openmesh.core.ReceiptWriteResult
+import com.openmesh.core.StaleTransferLeaseException
 import com.openmesh.core.TombstoneReason
 import com.openmesh.core.TransferAttemptId
 import com.openmesh.core.TransferAttemptState
@@ -45,7 +49,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -183,6 +186,43 @@ class AndroidDeliveryStoreTest {
     }
 
     @Test
+    fun `duplicate receipt is idempotent and conflicting reuse rolls back`() = runBlocking {
+        val name = databaseName()
+        val store = AndroidDeliveryStore(context, name)
+        val delivery = deliveryObject("sqlite-receipt")
+        store.ingest(ingest(delivery), nowMs = 100)
+        val receipt = ReceiptInput.copyOf(
+            receiptId = ReceiptId("sqlite-receipt-1"),
+            deliveryId = delivery.deliveryId,
+            evidence = ReceiptEvidence.DESTINATION_STORED,
+            issuer = "endpoint-authority-1",
+            verification = ReceiptVerification.AUTHENTICATED_AND_AUTHORIZED,
+            protectedBytes = byteArrayOf(1, 2, 3),
+        )
+
+        assertTrue(store.recordReceipt(receipt, nowMs = 200) is ReceiptWriteResult.Stored)
+        store.close()
+
+        val recovered = AndroidDeliveryStore(context, name)
+        assertTrue(recovered.recordReceipt(receipt, nowMs = 201) is ReceiptWriteResult.Duplicate)
+        val conflicting = ReceiptInput.copyOf(
+            receiptId = receipt.receiptId,
+            deliveryId = delivery.deliveryId,
+            evidence = receipt.evidence,
+            issuer = receipt.issuer,
+            verification = receipt.verification,
+            protectedBytes = byteArrayOf(9),
+        )
+        expectSuspendThrows(ReceiptIdentityConflictException::class.java) {
+            recovered.recordReceipt(conflicting, nowMs = 202)
+        }
+
+        assertEquals(1, recovered.snapshot(delivery.deliveryId).receipts.size)
+        assertEquals(2, recovered.listOutbox().size)
+        recovered.close()
+    }
+
+    @Test
     fun `lease and attempt recover after database close and reopen`() = runBlocking {
         val name = databaseName()
         val firstStore = AndroidDeliveryStore(
@@ -209,6 +249,39 @@ class AndroidDeliveryStoreTest {
         assertEquals(TransferAttemptState.LINK_WRITE_COMPLETED, completed.state)
         recovered.close()
     }
+
+    @Test
+    fun `expired persisted lease preserves its attempt and permits a new reservation`() =
+        runBlocking {
+            val name = databaseName()
+            val store = AndroidDeliveryStore(context, name)
+            val delivery = deliveryObject("sqlite-expired-lease")
+            store.ingest(ingest(delivery), nowMs = 100)
+            val request = TransferReservation(
+                deliveryId = delivery.deliveryId,
+                context = transferContext(),
+                leaseDurationMs = 10,
+            )
+            val first = store.reserveTransfer(request, nowMs = 110)
+                as TransferReservationResult.Acquired
+            assertTrue(store.reserveTransfer(request, nowMs = 119) is TransferReservationResult.Busy)
+            store.close()
+
+            val recovered = AndroidDeliveryStore(context, name)
+            val resumed = recovered.reserveTransfer(request, nowMs = 120)
+                as TransferReservationResult.Acquired
+
+            assertNotEquals(first.attempt.attemptId, resumed.attempt.attemptId)
+            assertEquals(
+                setOf(TransferAttemptState.LEASE_EXPIRED, TransferAttemptState.RESERVED),
+                recovered.snapshot(delivery.deliveryId).transferAttempts
+                    .mapTo(mutableSetOf()) { it.state },
+            )
+            expectSuspendThrows(StaleTransferLeaseException::class.java) {
+                recovered.markTransferStarted(first.lease, nowMs = 121)
+            }
+            recovered.close()
+        }
 
     @Test
     fun `link write and untrusted receipts never create durable acceptance`() = runBlocking {
@@ -282,6 +355,67 @@ class AndroidDeliveryStoreTest {
     }
 
     @Test
+    fun `authorized receipt becomes durable acceptance only through verified authority`() =
+        runBlocking {
+            val name = databaseName()
+            val store = AndroidDeliveryStore(context, name)
+            val delivery = deliveryObject("sqlite-authorized-receipt")
+            store.ingest(ingest(delivery), nowMs = 100)
+            val acquired = store.reserveTransfer(
+                TransferReservation(delivery.deliveryId, transferContext(), 1_000),
+                nowMs = 110,
+            ) as TransferReservationResult.Acquired
+            store.markTransferStarted(acquired.lease, nowMs = 120)
+            store.recordLinkWriteCompleted(acquired.lease, nowMs = 130)
+            val receipt = ReceiptInput.copyOf(
+                receiptId = ReceiptId("sqlite-authorized-next-hop"),
+                deliveryId = delivery.deliveryId,
+                evidence = ReceiptEvidence.NEXT_HOP_ACCEPTED_DURABLY,
+                issuer = "authenticated-next-hop",
+                verification = ReceiptVerification.AUTHENTICATED_AND_AUTHORIZED,
+                protectedBytes = byteArrayOf(1, 2, 3),
+                linkedTransferAttemptId = acquired.attempt.attemptId,
+            )
+
+            val storedReceipt = store.recordReceipt(receipt, nowMs = 135)
+            assertNull(storedReceipt.record.appliedAtMs)
+            assertEquals(
+                TransferAttemptState.LINK_WRITE_COMPLETED,
+                store.snapshot(delivery.deliveryId).transferAttempts.single().state,
+            )
+            val acceptance = verifiedReceiptAcceptance(receipt)
+            assertTrue(
+                store.recordNextHopAcceptedDurably(acceptance, nowMs = 140) is
+                    NextHopAcceptanceWriteResult.Stored
+            )
+            store.close()
+
+            val recovered = AndroidDeliveryStore(context, name)
+            assertTrue(
+                recovered.recordNextHopAcceptedDurably(acceptance, nowMs = 141) is
+                    NextHopAcceptanceWriteResult.Duplicate
+            )
+            val snapshot = recovered.snapshot(delivery.deliveryId)
+            assertEquals(DeliveryState.WAITING, snapshot.deliveryRecord?.state)
+            assertEquals(
+                TransferAttemptState.NEXT_HOP_ACCEPTED_DURABLY,
+                snapshot.transferAttempts.single().state,
+            )
+            assertEquals(
+                NextHopAcceptanceEvidenceKind.AUTHENTICATED_RECEIPT,
+                snapshot.nextHopAcceptances.single().kind,
+            )
+            assertEquals(140L, snapshot.receipts.single().appliedAtMs)
+            assertEquals(
+                1,
+                recovered.listOutbox().count {
+                    it.event is DeliveryStoreEvent.NextHopAcceptedDurably
+                },
+            )
+            recovered.close()
+        }
+
+    @Test
     fun `outbox sequence remains monotonic after acknowledgement prune and reopen`() = runBlocking {
         val name = databaseName()
         val store = AndroidDeliveryStore(context, name)
@@ -321,6 +455,73 @@ class AndroidDeliveryStoreTest {
         )
         recovered.close()
     }
+
+    @Test
+    fun `application acknowledgement and outbox fact commit atomically`() = runBlocking {
+        val name = databaseName()
+        var failOn: AndroidDeliveryStore.CommitKind? = null
+        val store = AndroidDeliveryStore(
+            context = context,
+            databaseName = name,
+            limits = DeliveryStoreLimits(),
+            beforeCommit = { kind -> if (kind == failOn) throw SimulatedCrash() },
+            leaseTokenSource = { "test-owner-token" },
+        )
+        val delivery = deliveryObject("sqlite-app-ack")
+        store.ingest(ingest(delivery, destinationIsLocal = true), nowMs = 100)
+        val baselineOutbox = store.listOutbox()
+        failOn = AndroidDeliveryStore.CommitKind.ACKNOWLEDGE_APPLICATION
+
+        expectSuspendThrows(SimulatedCrash::class.java) {
+            store.acknowledgeApplicationDelivery(delivery.deliveryId, nowMs = 200)
+        }
+
+        val afterFailure = store.snapshot(delivery.deliveryId)
+        assertEquals(DeliveryState.APP_PENDING, afterFailure.deliveryRecord?.state)
+        assertEquals(InboxState.PENDING, afterFailure.inboxRecord?.state)
+        assertEquals(baselineOutbox, store.listOutbox())
+        store.close()
+
+        val recovered = AndroidDeliveryStore(context, name)
+        recovered.acknowledgeApplicationDelivery(delivery.deliveryId, nowMs = 201)
+        val committed = recovered.snapshot(delivery.deliveryId)
+        assertEquals(DeliveryState.APP_DELIVERED, committed.deliveryRecord?.state)
+        assertEquals(InboxState.DELIVERED, committed.inboxRecord?.state)
+        assertTrue(recovered.listOutbox().last().event is DeliveryStoreEvent.ApplicationDelivered)
+        recovered.close()
+    }
+
+    @Test
+    fun `object and outbox admission bounds roll back the complete SQLite transaction`() =
+        runBlocking {
+            val oversized = deliveryObject(
+                id = "sqlite-too-large",
+                bytes = byteArrayOf(1, 2, 3),
+            )
+            val objectBounded = newStore(
+                DeliveryStoreLimits(maxObjectBytes = 2),
+            )
+            expectSuspendThrows(DeliveryStoreAdmissionException::class.java) {
+                objectBounded.ingest(ingest(oversized), nowMs = 100)
+            }
+            assertNull(objectBounded.snapshot(oversized.deliveryId).deliveryRecord)
+            assertTrue(objectBounded.listOutbox().isEmpty())
+            objectBounded.close()
+
+            val local = deliveryObject("sqlite-outbox-bound")
+            val outboxBounded = newStore(
+                DeliveryStoreLimits(maxOutboxRecords = 1),
+            )
+            expectSuspendThrows(DeliveryStoreAdmissionException::class.java) {
+                outboxBounded.ingest(
+                    ingest(local, destinationIsLocal = true),
+                    nowMs = 100,
+                )
+            }
+            assertNull(outboxBounded.snapshot(local.deliveryId).deliveryRecord)
+            assertTrue(outboxBounded.listOutbox().isEmpty())
+            outboxBounded.close()
+        }
 
     @Test
     fun `schema owns every ratified aggregate and migration metadata`() = runBlocking {
@@ -428,6 +629,17 @@ class AndroidDeliveryStoreTest {
             }
         }.toTypedArray()
         return method.invoke(companion, *arguments) as VerifiedNextHopAcceptance
+    }
+
+    private fun verifiedReceiptAcceptance(
+        receipt: ReceiptInput,
+    ): VerifiedNextHopAcceptance {
+        val companion = VerifiedNextHopAcceptance.Companion
+        val method = companion::class.java.declaredMethods.single {
+            it.name.startsWith("fromAuthenticatedReceipt")
+        }
+        method.isAccessible = true
+        return method.invoke(companion, receipt) as VerifiedNextHopAcceptance
     }
 
     private suspend fun <T : Throwable> expectSuspendThrows(
