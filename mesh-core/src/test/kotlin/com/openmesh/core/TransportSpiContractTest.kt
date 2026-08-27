@@ -165,6 +165,58 @@ class TransportSpiContractTest {
         }
 
     @Test
+    fun `unavailable opportunity lifecycle cannot be reopened or alias a later contact`() =
+        runBlocking {
+            val applied = mutableListOf<TransportOpportunityReference>()
+            val adapter = FakeTransportAdapter(ADAPTER_ID) { request ->
+                applied += request.opportunity
+                TransportTransferResult.CompletedLocally(
+                    transferId = request.transferId,
+                    occurredAtMs = 250,
+                )
+            }
+            val peerA = opportunity(
+                peer = knownPeer(seed = 1),
+                address = TransportAddress.copyOf(ADAPTER_ID, "address-a".encodeToByteArray()),
+            )
+
+            adapter.emit(TransportEvent.OpportunityAvailable(peerA))
+            adapter.emit(
+                TransportEvent.OpportunityUnavailable(
+                    opportunity = peerA.reference,
+                    occurredAtMs = 150,
+                    reason = TransportOpportunityUnavailableReason.LOST,
+                ),
+            )
+
+            val aliasedPeerB = opportunity(
+                peer = knownPeer(seed = 2),
+                address = TransportAddress.copyOf(ADAPTER_ID, "address-b".encodeToByteArray()),
+            )
+            expectThrows<IllegalArgumentException> {
+                adapter.emit(TransportEvent.OpportunityAvailable(aliasedPeerB))
+            }
+            expectThrows<IllegalArgumentException> {
+                adapter.emit(
+                    TransportEvent.OpportunityAvailable(
+                        aliasedPeerB.copy(revision = REVISION_2),
+                    ),
+                )
+            }
+
+            val newPeerB = aliasedPeerB.copy(opportunityId = OPPORTUNITY_ID_2)
+            adapter.emit(TransportEvent.OpportunityAvailable(newPeerB))
+
+            val stale = adapter.transfer(transferRequest(peerA.reference))
+            assertTrue(stale is TransportTransferResult.OpportunityUnavailable)
+            assertTrue(applied.isEmpty())
+
+            val current = adapter.transfer(transferRequest(newPeerB.reference))
+            assertTrue(current is TransportTransferResult.CompletedLocally)
+            assertEquals(listOf(newPeerB.reference), applied)
+        }
+
+    @Test
     fun `inbound bytes and transport addresses are opaque defensive copies`() {
         val addressInput = byteArrayOf(0x01, 0x02, 0x03)
         val payloadInput = byteArrayOf(0x10, 0x20, 0x30, 0x40)
@@ -432,6 +484,7 @@ class TransportSpiContractTest {
         private val mutableEvents = MutableSharedFlow<TransportEvent>(extraBufferCapacity = 8)
         private val currentOpportunities =
             linkedMapOf<TransportOpportunityKey, TransportOpportunityReference>()
+        private val publishedOpportunityKeys = mutableSetOf<TransportOpportunityKey>()
         override val events: Flow<TransportEvent> = mutableEvents.asSharedFlow()
 
         var startTransitions: Int = 0
@@ -474,6 +527,9 @@ class TransportSpiContractTest {
             require(event.adapterId == adapterId) { "Event belongs to another adapter" }
             when (event) {
                 is TransportEvent.OpportunityAvailable -> {
+                    require(publishedOpportunityKeys.add(event.opportunity.key)) {
+                        "Transport opportunity ID identifies one lifecycle and cannot be reused"
+                    }
                     currentOpportunities[event.opportunity.key] = event.opportunity.reference
                 }
 
@@ -485,7 +541,10 @@ class TransportSpiContractTest {
                 }
 
                 is TransportEvent.OpportunityUnavailable -> {
-                    currentOpportunities.remove(event.opportunity.key, event.opportunity)
+                    require(currentOpportunities[event.opportunity.key] == event.opportunity) {
+                        "Unavailable opportunity is not the current revision"
+                    }
+                    currentOpportunities.remove(event.opportunity.key)
                 }
 
                 is TransportEvent.InboundBytes -> Unit
@@ -497,6 +556,7 @@ class TransportSpiContractTest {
     private companion object {
         val ADAPTER_ID = TransportAdapterId("test-radio")
         val OPPORTUNITY_ID = TransportOpportunityId("temporary-contact-1")
+        val OPPORTUNITY_ID_2 = TransportOpportunityId("temporary-contact-2")
         val REVISION_1 = TransportOpportunityRevision(1)
         val REVISION_2 = TransportOpportunityRevision(2)
         val TRANSFER_ID = TransportTransferId("transport-request-1")

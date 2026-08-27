@@ -21,7 +21,16 @@ value class TransportAdapterId(val value: String) {
     }
 }
 
-/** Adapter-scoped identity of one temporary, locally observed opportunity. */
+/**
+ * Adapter-scoped identity of exactly one temporary opportunity lifecycle.
+ *
+ * A lifecycle begins with [TransportEvent.OpportunityAvailable] and ends with
+ * [TransportEvent.OpportunityUnavailable]. Its ID is single-use: after the
+ * lifecycle ends, no revision of that ID may ever become available again. A
+ * contact observed again must receive a new ID, even if its peer or transport
+ * address appears unchanged. Adapters must therefore generate IDs that cannot
+ * alias stale references across stop/start or process-restart boundaries.
+ */
 @JvmInline
 value class TransportOpportunityId(val value: String) {
     init {
@@ -206,6 +215,10 @@ sealed interface TransportEvent {
     val adapterId: TransportAdapterId
     val occurredAtMs: Long
 
+    /**
+     * Starts a new opportunity lifecycle for a never-before-published key.
+     * A key made unavailable is terminal and cannot be reopened.
+     */
     data class OpportunityAvailable(
         val opportunity: TransportOpportunity,
     ) : TransportEvent {
@@ -238,6 +251,10 @@ sealed interface TransportEvent {
             get() = opportunity.observedAtMs
     }
 
+    /**
+     * Terminates this opportunity key permanently. Later observations of the
+     * same contact must use a new [TransportOpportunityId].
+     */
     data class OpportunityUnavailable(
         val opportunity: TransportOpportunityReference,
         override val occurredAtMs: Long,
@@ -424,9 +441,11 @@ interface TransportAdapter {
 
     /**
      * Moves bytes only if [TransportTransferRequest.opportunity] is still the
-     * adapter's current exact revision. A missing or superseded revision returns
-     * [TransportTransferResult.OpportunityUnavailable]; it must never be
-     * resolved against newer peer, address, direction, or freshness facts.
+     * adapter's current exact revision. A missing, superseded, or terminal
+     * revision returns [TransportTransferResult.OpportunityUnavailable]; it
+     * must never be resolved against newer peer, address, direction, or
+     * freshness facts. Once unavailable, a reference can never become current
+     * again because its opportunity ID cannot be reused.
      */
     suspend fun transfer(request: TransportTransferRequest): TransportTransferResult
 }
