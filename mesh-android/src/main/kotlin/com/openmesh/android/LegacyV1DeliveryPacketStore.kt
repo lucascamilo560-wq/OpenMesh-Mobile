@@ -150,7 +150,8 @@ class LegacyV1DeliveryPacketStore internal constructor(
         else nowMs + tombstoneRetentionMs
 
     companion object {
-        const val DEFAULT_TOMBSTONE_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
+        /** Conservative until the production cutover supplies an explicit retention policy. */
+        const val DEFAULT_TOMBSTONE_RETENTION_MS = Long.MAX_VALUE
         internal const val RUNTIME_V1_PROVENANCE = "legacy-v1-runtime:mesh-envelope-v1"
     }
 }
