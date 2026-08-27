@@ -18,6 +18,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -399,7 +400,7 @@ class BleTransportAdapterTest {
 
     private suspend fun awaitEvents(events: List<TransportEvent>, expectedSize: Int) {
         withTimeout(1_000) {
-            while (events.size < expectedSize) yield()
+            while (events.size < expectedSize) delay(1)
         }
     }
 
@@ -408,7 +409,7 @@ class BleTransportAdapterTest {
         predicate: (TransportEvent) -> Boolean,
     ) {
         withTimeout(1_000) {
-            while (events.none(predicate)) yield()
+            while (events.none(predicate)) delay(1)
         }
     }
 
@@ -417,7 +418,7 @@ class BleTransportAdapterTest {
         expectedCount: Int,
     ) {
         withTimeout(1_000) {
-            while (events.count { it is T } < expectedCount) yield()
+            while (events.count { it is T } < expectedCount) delay(1)
         }
     }
 
