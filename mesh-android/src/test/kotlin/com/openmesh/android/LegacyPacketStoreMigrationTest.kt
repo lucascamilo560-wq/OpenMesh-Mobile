@@ -2,17 +2,22 @@ package com.openmesh.android
 
 import android.content.Context
 import com.openmesh.core.DeliveryId
+import com.openmesh.core.DeliverySnapshot
 import com.openmesh.core.DeliveryState
+import com.openmesh.core.DeliveryStoreEvent
 import com.openmesh.core.IngressProvenance
 import com.openmesh.core.MeshEnvelope
+import com.openmesh.core.NodeId
 import com.openmesh.core.PacketPriority
+import com.openmesh.core.TransferContext
+import com.openmesh.core.TransferReservation
+import com.openmesh.core.TransferReservationResult
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -48,69 +53,123 @@ class LegacyPacketStoreMigrationTest {
     }
 
     @Test
-    fun `migration verifies active and expired packets and retains legacy bytes`() = runBlocking {
+    fun `migration preserves remote local broadcast and expired legacy disposition`() = runBlocking {
         val legacy = SharedPreferencesPacketStore(context, preferencesName)
-        val active = envelope("legacy-active", createdAtMs = 100, expiresAtMs = 10_000)
+        val remote = envelope("legacy-remote", createdAtMs = 100, expiresAtMs = 10_000)
+        val local = envelope(
+            "legacy-local",
+            createdAtMs = 100,
+            expiresAtMs = 10_000,
+            destinationNodeId = LOCAL_NODE_ID.value,
+        )
+        val broadcast = envelope(
+            "legacy-broadcast",
+            createdAtMs = 100,
+            expiresAtMs = 10_000,
+            destinationNodeId = null,
+        )
         val expired = envelope("legacy-expired", createdAtMs = 100, expiresAtMs = 200)
-        legacy.put(active)
+        legacy.put(remote)
+        legacy.put(local)
+        legacy.put(broadcast)
         legacy.put(expired)
         val store = AndroidDeliveryStore(context, databaseName)
         val migrator = LegacyPacketStoreMigrator(
             context = context,
             store = store,
+            localNodeId = LOCAL_NODE_ID,
             legacyPreferencesName = preferencesName,
         )
 
         val report = migrator.migrate(nowMs = 300)
 
         assertEquals(LegacyMigrationState.LEGACY_RETAINED, report.status.state)
-        assertEquals(2, report.status.expectedCount)
-        assertEquals(2, report.status.importedCount)
+        assertEquals(LOCAL_NODE_ID, report.status.localNodeId)
+        assertEquals(4, report.status.expectedCount)
+        assertEquals(4, report.status.importedCount)
         assertEquals(report.status.expectedManifestHash, report.status.importedManifestHash)
         assertTrue(report.legacyStoreRetained)
-        assertEquals(2, legacy.list().size)
+        assertEquals(4, legacy.list().size)
 
-        val activeSnapshot = store.snapshot(DeliveryId(active.packetId))
-        assertNotNull(activeSnapshot.deliveryObject)
-        assertEquals(DeliveryState.WAITING, activeSnapshot.deliveryRecord?.state)
+        val remoteSnapshot = store.snapshot(DeliveryId(remote.packetId))
+        assertNotNull(remoteSnapshot.deliveryObject)
+        assertEquals(DeliveryState.WAITING, remoteSnapshot.deliveryRecord?.state)
         assertTrue(
-            activeSnapshot.deliveryRecord?.provenance?.any {
+            remoteSnapshot.deliveryRecord?.provenance?.any {
                 it.kind == IngressProvenance.Kind.LEGACY_IMPORT
             } == true
         )
-        assertTrue(activeSnapshot.transferAttempts.isEmpty())
-        assertTrue(activeSnapshot.nextHopAcceptances.isEmpty())
-        assertTrue(activeSnapshot.receipts.isEmpty())
-        assertNull(activeSnapshot.inboxRecord)
+        assertNoInventedFacts(remoteSnapshot)
+
+        val broadcastSnapshot = store.snapshot(DeliveryId(broadcast.packetId))
+        assertNotNull(broadcastSnapshot.deliveryObject)
+        assertEquals(DeliveryState.WAITING, broadcastSnapshot.deliveryRecord?.state)
+        assertNoInventedFacts(broadcastSnapshot)
+
+        val localSnapshot = store.snapshot(DeliveryId(local.packetId))
+        assertNotNull(localSnapshot.deliveryObject)
+        assertEquals(DeliveryState.QUARANTINED, localSnapshot.deliveryRecord?.state)
+        assertNoInventedFacts(localSnapshot)
+        assertTrue(
+            store.reserveTransfer(reservation(local.packetId), nowMs = 301) is
+                TransferReservationResult.NotEligible
+        )
 
         val expiredSnapshot = store.snapshot(DeliveryId(expired.packetId))
         assertNull(expiredSnapshot.deliveryObject)
         assertEquals(DeliveryState.EXPIRED, expiredSnapshot.deliveryRecord?.state)
         assertNotNull(expiredSnapshot.tombstone)
-        assertTrue(expiredSnapshot.transferAttempts.isEmpty())
-        assertTrue(expiredSnapshot.nextHopAcceptances.isEmpty())
-        assertTrue(expiredSnapshot.receipts.isEmpty())
-        assertNull(expiredSnapshot.inboxRecord)
+        assertNoInventedFacts(expiredSnapshot)
+
+        assertFalse(
+            store.listOutbox().any { record ->
+                record.event is DeliveryStoreEvent.ApplicationDeliveryAvailable ||
+                    record.event is DeliveryStoreEvent.ApplicationDelivered
+            }
+        )
 
         val outboxBeforeRetry = store.listOutbox()
-        val retried = migrator.migrate(nowMs = 301)
+        val retried = migrator.migrate(nowMs = 302)
         assertEquals(LegacyMigrationState.LEGACY_RETAINED, retried.status.state)
         assertEquals(outboxBeforeRetry, store.listOutbox())
-        assertEquals(2, legacy.list().size)
+        assertEquals(4, legacy.list().size)
+        assertTrue(
+            store.reserveTransfer(reservation(remote.packetId), nowMs = 303) is
+                TransferReservationResult.Acquired
+        )
+        assertTrue(
+            store.reserveTransfer(reservation(broadcast.packetId), nowMs = 303) is
+                TransferReservationResult.Acquired
+        )
         store.close()
     }
 
     @Test
-    fun `process death after one imported entry resumes without duplicates`() = runBlocking {
+    fun `process death resumes mixed disposition without reclassification or duplicates`() = runBlocking {
         val legacy = SharedPreferencesPacketStore(context, preferencesName)
-        legacy.put(envelope("legacy-a", 100, 10_000))
-        legacy.put(envelope("legacy-b", 100, 10_000))
+        val local = envelope(
+            "legacy-a-local",
+            100,
+            10_000,
+            destinationNodeId = LOCAL_NODE_ID.value,
+        )
+        val broadcast = envelope(
+            "legacy-b-broadcast",
+            100,
+            10_000,
+            destinationNodeId = null,
+        )
+        val remote = envelope("legacy-c-remote", 100, 10_000)
+        legacy.put(local)
+        legacy.put(broadcast)
+        legacy.put(remote)
         var committedEntries = 0
         val firstStore = AndroidDeliveryStore(context, databaseName)
         val crashingMigrator = LegacyPacketStoreMigrator(
             store = firstStore,
             source = SharedPreferencesLegacyPacketSource(context, preferencesName),
             migrationId = LegacyPacketStoreMigrator.DEFAULT_MIGRATION_ID,
+            localNodeId = LOCAL_NODE_ID,
             hooks = LegacyMigrationHooks(
                 afterEntryCommitted = {
                     committedEntries += 1
@@ -129,16 +188,82 @@ class LegacyPacketStoreMigrationTest {
 
         val recoveredStore = AndroidDeliveryStore(context, databaseName)
         val recoveredMigrator = LegacyPacketStoreMigrator(
-            context,
-            recoveredStore,
-            preferencesName,
+            context = context,
+            store = recoveredStore,
+            localNodeId = LOCAL_NODE_ID,
+            legacyPreferencesName = preferencesName,
         )
         val report = recoveredMigrator.migrate(nowMs = 201)
 
         assertEquals(LegacyMigrationState.LEGACY_RETAINED, report.status.state)
-        assertEquals(2, report.status.importedCount)
-        assertEquals(2, recoveredStore.listOutbox().size)
-        assertEquals(2, legacy.list().size)
+        assertEquals(3, report.status.importedCount)
+        assertEquals(3, recoveredStore.listOutbox().size)
+        assertEquals(3, legacy.list().size)
+        assertEquals(
+            DeliveryState.QUARANTINED,
+            recoveredStore.snapshot(DeliveryId(local.packetId)).deliveryRecord?.state,
+        )
+        assertEquals(
+            DeliveryState.WAITING,
+            recoveredStore.snapshot(DeliveryId(broadcast.packetId)).deliveryRecord?.state,
+        )
+        assertEquals(
+            DeliveryState.WAITING,
+            recoveredStore.snapshot(DeliveryId(remote.packetId)).deliveryRecord?.state,
+        )
+        recoveredStore.close()
+    }
+
+    @Test
+    fun `retry with a different local node fails closed before reclassification`() = runBlocking {
+        val legacy = SharedPreferencesPacketStore(context, preferencesName)
+        val local = envelope(
+            "legacy-node-bound",
+            100,
+            10_000,
+            destinationNodeId = LOCAL_NODE_ID.value,
+        )
+        legacy.put(local)
+        val firstStore = AndroidDeliveryStore(context, databaseName)
+        val crashing = LegacyPacketStoreMigrator(
+            store = firstStore,
+            source = SharedPreferencesLegacyPacketSource(context, preferencesName),
+            migrationId = LegacyPacketStoreMigrator.DEFAULT_MIGRATION_ID,
+            localNodeId = LOCAL_NODE_ID,
+            hooks = LegacyMigrationHooks(
+                afterEntryCommitted = { throw SimulatedProcessDeath() }
+            ),
+        )
+        expectSuspendThrows(SimulatedProcessDeath::class.java) {
+            crashing.migrate(nowMs = 200)
+        }
+        firstStore.close()
+
+        val recoveredStore = AndroidDeliveryStore(context, databaseName)
+        val wrongNodeMigrator = LegacyPacketStoreMigrator(
+            context = context,
+            store = recoveredStore,
+            localNodeId = OTHER_LOCAL_NODE_ID,
+            legacyPreferencesName = preferencesName,
+        )
+        expectSuspendThrows(LegacyMigrationVerificationException::class.java) {
+            wrongNodeMigrator.migrate(nowMs = 201)
+        }
+
+        assertEquals(LegacyMigrationState.IMPORTING, wrongNodeMigrator.status()?.state)
+        assertEquals(LOCAL_NODE_ID, wrongNodeMigrator.status()?.localNodeId)
+        assertEquals(
+            DeliveryState.QUARANTINED,
+            recoveredStore.snapshot(DeliveryId(local.packetId)).deliveryRecord?.state,
+        )
+        val recovered = LegacyPacketStoreMigrator(
+            context = context,
+            store = recoveredStore,
+            localNodeId = LOCAL_NODE_ID,
+            legacyPreferencesName = preferencesName,
+        ).migrate(nowMs = 202)
+        assertEquals(LegacyMigrationState.LEGACY_RETAINED, recovered.status.state)
+        assertEquals(1, recoveredStore.listOutbox().size)
         recoveredStore.close()
     }
 
@@ -151,6 +276,7 @@ class LegacyPacketStoreMigrationTest {
             store = firstStore,
             source = SharedPreferencesLegacyPacketSource(context, preferencesName),
             migrationId = LegacyPacketStoreMigrator.DEFAULT_MIGRATION_ID,
+            localNodeId = LOCAL_NODE_ID,
             hooks = LegacyMigrationHooks(
                 afterStatePersisted = { state ->
                     if (state == LegacyMigrationState.VERIFYING) {
@@ -168,9 +294,10 @@ class LegacyPacketStoreMigrationTest {
 
         val recoveredStore = AndroidDeliveryStore(context, databaseName)
         val recovered = LegacyPacketStoreMigrator(
-            context,
-            recoveredStore,
-            preferencesName,
+            context = context,
+            store = recoveredStore,
+            localNodeId = LOCAL_NODE_ID,
+            legacyPreferencesName = preferencesName,
         ).migrate(nowMs = 201)
 
         assertEquals(LegacyMigrationState.LEGACY_RETAINED, recovered.status.state)
@@ -187,9 +314,10 @@ class LegacyPacketStoreMigrationTest {
         )
         val store = AndroidDeliveryStore(context, databaseName)
         val migrator = LegacyPacketStoreMigrator(
-            context,
-            store,
-            preferencesName,
+            context = context,
+            store = store,
+            localNodeId = LOCAL_NODE_ID,
+            legacyPreferencesName = preferencesName,
         )
 
         expectSuspendThrows(LegacyMigrationValidationException::class.java) {
@@ -210,6 +338,7 @@ class LegacyPacketStoreMigrationTest {
             store = firstStore,
             source = SharedPreferencesLegacyPacketSource(context, preferencesName),
             migrationId = LegacyPacketStoreMigrator.DEFAULT_MIGRATION_ID,
+            localNodeId = LOCAL_NODE_ID,
             hooks = LegacyMigrationHooks(
                 afterEntryCommitted = { throw SimulatedProcessDeath() }
             ),
@@ -222,9 +351,10 @@ class LegacyPacketStoreMigrationTest {
         legacy.put(envelope("legacy-added", 100, 10_000))
         val recoveredStore = AndroidDeliveryStore(context, databaseName)
         val recovered = LegacyPacketStoreMigrator(
-            context,
-            recoveredStore,
-            preferencesName,
+            context = context,
+            store = recoveredStore,
+            localNodeId = LOCAL_NODE_ID,
+            legacyPreferencesName = preferencesName,
         )
 
         expectSuspendThrows(LegacyMigrationVerificationException::class.java) {
@@ -240,16 +370,34 @@ class LegacyPacketStoreMigrationTest {
         packetId: String,
         createdAtMs: Long,
         expiresAtMs: Long,
+        destinationNodeId: String? = REMOTE_NODE_ID.value,
     ): MeshEnvelope = MeshEnvelope(
         packetId = packetId,
-        sourceNodeId = "om1-00000000000000000000000000000000",
-        destinationNodeId = "om1-11111111111111111111111111111111",
+        sourceNodeId = SOURCE_NODE_ID.value,
+        destinationNodeId = destinationNodeId,
         createdAtMs = createdAtMs,
         expiresAtMs = expiresAtMs,
         priority = PacketPriority.NORMAL,
         contentType = "text/plain",
         payloadBase64 = "bGVnYWN5",
     )
+
+    private fun reservation(packetId: String): TransferReservation = TransferReservation(
+        deliveryId = DeliveryId(packetId),
+        context = TransferContext(
+            adapterId = "legacy-migration-test",
+            opportunityId = "opportunity-$packetId",
+        ),
+        leaseDurationMs = 1_000,
+    )
+
+    private fun assertNoInventedFacts(snapshot: DeliverySnapshot) {
+        assertTrue(snapshot.transferAttempts.isEmpty())
+        assertTrue(snapshot.nextHopAcceptances.isEmpty())
+        assertTrue(snapshot.receipts.isEmpty())
+        assertNull(snapshot.inboxRecord)
+        assertFalse(snapshot.deliveryRecord?.state == DeliveryState.APP_DELIVERED)
+    }
 
     private suspend fun <T : Throwable> expectSuspendThrows(
         type: Class<T>,
@@ -265,4 +413,11 @@ class LegacyPacketStoreMigrationTest {
     }
 
     private class SimulatedProcessDeath : RuntimeException("simulated process death")
+
+    private companion object {
+        val SOURCE_NODE_ID = NodeId("om1-00000000000000000000000000000000")
+        val REMOTE_NODE_ID = NodeId("om1-11111111111111111111111111111111")
+        val LOCAL_NODE_ID = NodeId("om1-22222222222222222222222222222222")
+        val OTHER_LOCAL_NODE_ID = NodeId("om1-33333333333333333333333333333333")
+    }
 }

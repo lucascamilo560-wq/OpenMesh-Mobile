@@ -153,6 +153,7 @@ internal class OpenMeshDeliveryDatabase(
             CREATE TABLE ${DeliverySchema.MIGRATION_METADATA} (
                 migration_id TEXT NOT NULL PRIMARY KEY,
                 source_name TEXT NOT NULL,
+                local_node_id TEXT NOT NULL,
                 state TEXT NOT NULL,
                 expected_count INTEGER NOT NULL DEFAULT 0,
                 expected_manifest_hash TEXT,
@@ -169,6 +170,7 @@ internal class OpenMeshDeliveryDatabase(
                 legacy_key TEXT NOT NULL,
                 delivery_id TEXT NOT NULL,
                 canonical_hash TEXT NOT NULL,
+                disposition TEXT NOT NULL,
                 expired_at_import INTEGER NOT NULL CHECK(expired_at_import IN (0, 1)),
                 PRIMARY KEY(migration_id, legacy_key),
                 UNIQUE(migration_id, delivery_id)

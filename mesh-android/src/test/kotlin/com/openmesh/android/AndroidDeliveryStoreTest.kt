@@ -561,6 +561,24 @@ class AndroidDeliveryStoreTest {
                 )
             )
         )
+        val migrationColumns = database.rawQuery(
+            "PRAGMA table_info(migration_metadata)",
+            null,
+        ).use { cursor ->
+            buildSet {
+                while (cursor.moveToNext()) add(cursor.getString(1))
+            }
+        }
+        val importItemColumns = database.rawQuery(
+            "PRAGMA table_info(legacy_import_items)",
+            null,
+        ).use { cursor ->
+            buildSet {
+                while (cursor.moveToNext()) add(cursor.getString(1))
+            }
+        }
+        assertTrue("local_node_id" in migrationColumns)
+        assertTrue("disposition" in importItemColumns)
         database.close()
     }
 

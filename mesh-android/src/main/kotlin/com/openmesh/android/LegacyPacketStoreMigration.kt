@@ -18,6 +18,7 @@ import com.openmesh.core.EndpointId
 import com.openmesh.core.IngressProvenance
 import com.openmesh.core.MeshEnvelope
 import com.openmesh.core.MeshEnvelopeCodec
+import com.openmesh.core.NodeId
 import com.openmesh.core.TombstoneReason
 import java.net.URLEncoder
 import java.nio.ByteBuffer
@@ -35,6 +36,7 @@ enum class LegacyMigrationState {
 data class LegacyMigrationStatus(
     val migrationId: String,
     val sourceName: String,
+    val localNodeId: NodeId,
     val state: LegacyMigrationState,
     val expectedCount: Int,
     val expectedManifestHash: String?,
@@ -66,6 +68,7 @@ class LegacyPacketStoreMigrator internal constructor(
     private val store: AndroidDeliveryStore,
     private val source: LegacyPacketSource,
     private val migrationId: String,
+    private val localNodeId: NodeId,
     private val hooks: LegacyMigrationHooks,
 ) {
 
@@ -73,12 +76,14 @@ class LegacyPacketStoreMigrator internal constructor(
     constructor(
         context: Context,
         store: AndroidDeliveryStore,
+        localNodeId: NodeId,
         legacyPreferencesName: String = DEFAULT_LEGACY_PREFERENCES_NAME,
         migrationId: String = DEFAULT_MIGRATION_ID,
     ) : this(
         store = store,
         source = SharedPreferencesLegacyPacketSource(context, legacyPreferencesName),
         migrationId = migrationId,
+        localNodeId = localNodeId,
         hooks = LegacyMigrationHooks(),
     )
 
@@ -111,6 +116,7 @@ class LegacyPacketStoreMigrator internal constructor(
                     migrationId = migrationId,
                     sourceName = source.name,
                     entry = entry,
+                    localNodeId = localNodeId,
                     nowMs = nowMs,
                 )
                 hooks.afterEntryCommitted(entry.legacyKey)
@@ -128,6 +134,7 @@ class LegacyPacketStoreMigrator internal constructor(
                 migrationId = migrationId,
                 sourceName = source.name,
                 snapshot = snapshot,
+                localNodeId = localNodeId,
             )
             metadata = markVerified(snapshot, importedManifest, nowMs)
             hooks.afterStatePersisted(metadata.state)
@@ -144,6 +151,7 @@ class LegacyPacketStoreMigrator internal constructor(
                 migrationId = migrationId,
                 sourceName = source.name,
                 snapshot = retainedSnapshot,
+                localNodeId = localNodeId,
             )
             metadata = transitionState(
                 expected = LegacyMigrationState.VERIFIED,
@@ -164,6 +172,7 @@ class LegacyPacketStoreMigrator internal constructor(
             migrationId = migrationId,
             sourceName = source.name,
             snapshot = finalSnapshot,
+            localNodeId = localNodeId,
         )
         val finalStatus = checkNotNull(status())
         return LegacyMigrationReport(
@@ -197,6 +206,7 @@ class LegacyPacketStoreMigrator internal constructor(
         val values = ContentValues().apply {
             put("migration_id", migrationId)
             put("source_name", source.name)
+            put("local_node_id", localNodeId.value)
             put("state", LegacyMigrationState.NOT_STARTED.name)
             put("expected_count", 0)
             putNull("expected_manifest_hash")
@@ -274,6 +284,11 @@ class LegacyPacketStoreMigrator internal constructor(
                 "Migration source changed from ${metadata.sourceName} to ${source.name}"
             )
         }
+        if (metadata.localNodeId != localNodeId) {
+            throw LegacyMigrationVerificationException(
+                "Migration local node changed from ${metadata.localNodeId} to $localNodeId"
+            )
+        }
         if (metadata.state == LegacyMigrationState.NOT_STARTED) return
         if (
             metadata.expectedCount != snapshot.entries.size ||
@@ -326,6 +341,12 @@ internal data class LegacyMigrationHooks(
     val afterStatePersisted: (LegacyMigrationState) -> Unit = {},
     val afterEntryCommitted: (String) -> Unit = {},
 )
+
+internal enum class LegacyDeliveryDisposition {
+    REMOTE_FORWARDABLE,
+    BROADCAST_FORWARDABLE,
+    LOCAL_QUARANTINED,
+}
 
 internal interface LegacyPacketSource {
     val name: String
@@ -435,6 +456,7 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     migrationId: String,
     sourceName: String,
     entry: LegacyPacketEntry,
+    localNodeId: NodeId,
     nowMs: Long,
 ): Boolean = writeForLegacyMigration { transaction ->
     val database = transaction.database
@@ -446,10 +468,12 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
         )
     }
 
+    val disposition = entry.dispositionFor(localNodeId)
     loadLegacyItem(database, migrationId, entry.legacyKey)?.let { existing ->
         if (
             existing.deliveryId != entry.deliveryId ||
-            existing.canonicalHash != entry.canonicalHash
+            existing.canonicalHash != entry.canonicalHash ||
+            existing.disposition != disposition
         ) {
             throw LegacyMigrationVerificationException(
                 "Legacy import identity conflict for ${entry.legacyKey}"
@@ -467,22 +491,34 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     if (expired) {
         importExpiredLegacyDelivery(transaction, deliveryObject, provenance, nowMs)
     } else {
-        when (
-            ingestForLegacyMigration(
-                transaction,
-                DeliveryIngest(
+        when (disposition) {
+            LegacyDeliveryDisposition.LOCAL_QUARANTINED ->
+                importQuarantinedLegacyDelivery(
+                    transaction = transaction,
                     deliveryObject = deliveryObject,
-                    destinationIsLocal = false,
                     provenance = provenance,
-                ),
-                nowMs,
-            )
-        ) {
-            is DeliveryIngestResult.RejectedByTombstone ->
-                throw LegacyMigrationVerificationException(
-                    "A retained tombstone blocks legacy packet ${entry.deliveryId}"
+                    nowMs = nowMs,
                 )
-            else -> Unit
+
+            LegacyDeliveryDisposition.REMOTE_FORWARDABLE,
+            LegacyDeliveryDisposition.BROADCAST_FORWARDABLE -> when (
+                ingestForLegacyMigration(
+                    transaction,
+                    DeliveryIngest(
+                        deliveryObject = deliveryObject,
+                        destinationIsLocal = false,
+                        provenance = provenance,
+                    ),
+                    nowMs,
+                )
+            ) {
+                is DeliveryIngestResult.RejectedByTombstone ->
+                    throw LegacyMigrationVerificationException(
+                        "A retained tombstone blocks legacy packet ${entry.deliveryId}"
+                    )
+
+                else -> Unit
+            }
         }
     }
 
@@ -491,6 +527,7 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
         put("legacy_key", entry.legacyKey)
         put("delivery_id", entry.deliveryId.value)
         put("canonical_hash", entry.canonicalHash)
+        put("disposition", disposition.name)
         put("expired_at_import", if (expired) 1 else 0)
     }
     database.insertOrThrow(DeliverySchema.LEGACY_IMPORT_ITEMS, null, values)
@@ -508,6 +545,111 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     )
     transaction.markChanged()
     true
+}
+
+private fun AndroidDeliveryStore.importQuarantinedLegacyDelivery(
+    transaction: AndroidDeliveryStore.Transaction,
+    deliveryObject: DeliveryObject,
+    provenance: IngressProvenance,
+    nowMs: Long,
+) {
+    val database = transaction.database
+    if (deliveryObject.canonicalBytes.size > configuredLimits.maxObjectBytes) {
+        throw DeliveryStoreAdmissionException(
+            "Delivery object exceeds ${configuredLimits.maxObjectBytes} bytes"
+        )
+    }
+    val existingObject = loadMigrationObject(database, deliveryObject.deliveryId)
+    val existingRecord = loadMigrationRecord(database, deliveryObject.deliveryId)
+    if (existingObject != null && existingObject != deliveryObject) {
+        throw CanonicalDeliveryConflictException(deliveryObject.deliveryId)
+    }
+    if (existingRecord != null && existingObject == null) {
+        throw CanonicalDeliveryConflictException(deliveryObject.deliveryId)
+    }
+    if (
+        existingRecord != null &&
+        existingRecord.state != DeliveryState.QUARANTINED
+    ) {
+        throw LegacyMigrationVerificationException(
+            "Legacy-local packet ${deliveryObject.deliveryId} conflicts with existing " +
+                "state ${existingRecord.state}"
+        )
+    }
+
+    if (existingRecord == null) {
+        if (
+            DatabaseUtils.queryNumEntries(database, DeliverySchema.DELIVERY_RECORDS) >=
+            configuredLimits.maxDeliveryRecords
+        ) {
+            throw DeliveryStoreAdmissionException("Delivery record limit reached")
+        }
+        val recordValues = ContentValues().apply {
+            put("delivery_id", deliveryObject.deliveryId.value)
+            put("state", DeliveryState.QUARANTINED.name)
+            put("stored_at_ms", nowMs)
+            put("updated_at_ms", nowMs)
+            put("version", 1)
+        }
+        database.insertOrThrow(DeliverySchema.DELIVERY_RECORDS, null, recordValues)
+        val objectValues = ContentValues().apply {
+            put("delivery_id", deliveryObject.deliveryId.value)
+            put("destination", deliveryObject.destination.value)
+            deliveryObject.source?.let { put("source", it.value) } ?: putNull("source")
+            put("created_at_ms", deliveryObject.createdAtMs)
+            put("expires_at_ms", deliveryObject.expiresAtMs)
+            put("canonical_bytes", deliveryObject.canonicalBytes.copyToByteArray())
+            put("canonical_hash", sha256Hex(deliveryObject.canonicalBytes.copyToByteArray()))
+        }
+        database.insertOrThrow(DeliverySchema.DELIVERY_OBJECTS, null, objectValues)
+        transaction.markChanged()
+    }
+
+    if (!hasMigrationProvenance(database, deliveryObject.deliveryId, provenance)) {
+        val provenanceCount = DatabaseUtils.queryNumEntries(
+            database,
+            DeliverySchema.DELIVERY_PROVENANCE,
+            "delivery_id = ?",
+            arrayOf(deliveryObject.deliveryId.value),
+        )
+        if (provenanceCount >= configuredLimits.maxProvenanceEntriesPerDelivery) {
+            throw DeliveryStoreAdmissionException(
+                "Provenance limit reached for ${deliveryObject.deliveryId}"
+            )
+        }
+        val provenanceValues = ContentValues().apply {
+            put("delivery_id", deliveryObject.deliveryId.value)
+            put("kind", provenance.kind.name)
+            put("reference_value", provenance.reference.orEmpty())
+        }
+        database.insertOrThrow(
+            DeliverySchema.DELIVERY_PROVENANCE,
+            null,
+            provenanceValues,
+        )
+        if (existingRecord != null) {
+            val recordValues = ContentValues().apply {
+                put("updated_at_ms", nowMs)
+                put("version", existingRecord.version + 1)
+            }
+            check(
+                database.update(
+                    DeliverySchema.DELIVERY_RECORDS,
+                    recordValues,
+                    "delivery_id = ?",
+                    arrayOf(deliveryObject.deliveryId.value),
+                ) == 1
+            )
+        }
+        transaction.markChanged()
+    }
+
+    if (existingRecord == null) {
+        transaction.appendOutbox(
+            listOf(DeliveryStoreEvent.DurablyStored(deliveryObject.deliveryId)),
+            nowMs,
+        )
+    }
 }
 
 private fun AndroidDeliveryStore.importExpiredLegacyDelivery(
@@ -616,6 +758,7 @@ private suspend fun AndroidDeliveryStore.verifyLegacyImport(
     migrationId: String,
     sourceName: String,
     snapshot: LegacyPacketSnapshot,
+    localNodeId: NodeId,
 ): String = readForLegacyMigration { database ->
     val metadata = loadMigrationStatus(database, migrationId)
         ?: throw LegacyMigrationVerificationException("Missing migration metadata $migrationId")
@@ -624,6 +767,11 @@ private suspend fun AndroidDeliveryStore.verifyLegacyImport(
     }
     if (metadata.expectedManifestHash != snapshot.manifestHash) {
         throw LegacyMigrationVerificationException("Legacy manifest changed during verification")
+    }
+    if (metadata.localNodeId != localNodeId) {
+        throw LegacyMigrationVerificationException(
+            "Legacy migration local node changed during verification"
+        )
     }
 
     val imported = loadLegacyItems(database, migrationId)
@@ -646,6 +794,12 @@ private suspend fun AndroidDeliveryStore.verifyLegacyImport(
                 "SQLite fingerprint mismatch for ${item.legacyKey}"
             )
         }
+        val expectedDisposition = expected.dispositionFor(localNodeId)
+        if (item.disposition != expectedDisposition) {
+            throw LegacyMigrationVerificationException(
+                "SQLite disposition mismatch for ${item.legacyKey}"
+            )
+        }
         val provenance = IngressProvenance(
             IngressProvenance.Kind.LEGACY_IMPORT,
             legacyProvenanceReference(sourceName, item.legacyKey),
@@ -653,6 +807,11 @@ private suspend fun AndroidDeliveryStore.verifyLegacyImport(
         if (!hasMigrationProvenance(database, item.deliveryId, provenance)) {
             throw LegacyMigrationVerificationException(
                 "SQLite lacks LEGACY_IMPORT provenance for ${item.deliveryId}"
+            )
+        }
+        if (hasInventedLegacyFacts(database, item.deliveryId)) {
+            throw LegacyMigrationVerificationException(
+                "SQLite contains invented delivery evidence for ${item.deliveryId}"
             )
         }
         if (item.expiredAtImport) {
@@ -680,6 +839,16 @@ private suspend fun AndroidDeliveryStore.verifyLegacyImport(
                     "SQLite object hash mismatch for ${item.deliveryId}"
                 )
             }
+            val expectedState = when (item.disposition) {
+                LegacyDeliveryDisposition.LOCAL_QUARANTINED -> DeliveryState.QUARANTINED
+                LegacyDeliveryDisposition.REMOTE_FORWARDABLE,
+                LegacyDeliveryDisposition.BROADCAST_FORWARDABLE -> DeliveryState.WAITING
+            }
+            if (loadMigrationRecord(database, item.deliveryId)?.state != expectedState) {
+                throw LegacyMigrationVerificationException(
+                    "SQLite lifecycle mismatch for ${item.deliveryId}; expected $expectedState"
+                )
+            }
         }
     }
     val importedManifest = manifestEntriesHash(
@@ -704,6 +873,7 @@ private data class LegacyImportItem(
     val legacyKey: String,
     val deliveryId: DeliveryId,
     val canonicalHash: String,
+    val disposition: LegacyDeliveryDisposition,
     val expiredAtImport: Boolean,
 )
 
@@ -723,6 +893,7 @@ private fun loadMigrationStatus(
     LegacyMigrationStatus(
         migrationId = cursor.stringValue("migration_id"),
         sourceName = cursor.stringValue("source_name"),
+        localNodeId = NodeId(cursor.stringValue("local_node_id")),
         state = enumValueOf(cursor.stringValue("state")),
         expectedCount = cursor.intValue("expected_count"),
         expectedManifestHash = cursor.nullableStringValue("expected_manifest_hash"),
@@ -770,6 +941,7 @@ private fun Cursor.toLegacyImportItem(): LegacyImportItem = LegacyImportItem(
     legacyKey = stringValue("legacy_key"),
     deliveryId = DeliveryId(stringValue("delivery_id")),
     canonicalHash = stringValue("canonical_hash"),
+    disposition = enumValueOf(stringValue("disposition")),
     expiredAtImport = intValue("expired_at_import") == 1,
 )
 
@@ -844,6 +1016,31 @@ private fun hasMigrationTombstone(
     "delivery_id = ?",
     arrayOf(deliveryId.value),
 ) == 1L
+
+private fun hasInventedLegacyFacts(
+    database: SQLiteDatabase,
+    deliveryId: DeliveryId,
+): Boolean = listOf(
+    DeliverySchema.TRANSFER_ATTEMPTS,
+    DeliverySchema.ACCEPTANCE_EVIDENCE,
+    DeliverySchema.RECEIPTS,
+    DeliverySchema.INBOX,
+).any { table ->
+    DatabaseUtils.queryNumEntries(
+        database,
+        table,
+        "delivery_id = ?",
+        arrayOf(deliveryId.value),
+    ) > 0
+}
+
+private fun LegacyPacketEntry.dispositionFor(
+    localNodeId: NodeId,
+): LegacyDeliveryDisposition = when (envelope.destinationNodeId) {
+    null -> LegacyDeliveryDisposition.BROADCAST_FORWARDABLE
+    localNodeId.value -> LegacyDeliveryDisposition.LOCAL_QUARANTINED
+    else -> LegacyDeliveryDisposition.REMOTE_FORWARDABLE
+}
 
 private fun LegacyPacketEntry.toDeliveryObject(): DeliveryObject = DeliveryObject.copyOf(
     deliveryId = deliveryId,
