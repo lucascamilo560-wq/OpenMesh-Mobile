@@ -252,6 +252,7 @@ class BleTransportAdapterTest {
             assertEquals(ADDRESS_A, platform.sent.single().first)
             assertArrayEquals(arbitraryBytes, platform.sent.single().second)
 
+            clock.now = 120
             observe(adapter, ADDRESS_A, 120)
             awaitEvents(events, 2)
             val revisionTwo =
@@ -274,6 +275,7 @@ class BleTransportAdapterTest {
 
             // A second contact becomes current while the write is blocked. The
             // already authorized transfer must remain pinned to address A.
+            clock.now = 130
             observe(adapter, ADDRESS_B, 130)
 
             clock.now = 220
@@ -338,6 +340,7 @@ class BleTransportAdapterTest {
             )
             assertArrayEquals(invalidEnvelopeBytes, unknownInbound.bytes.copyToByteArray())
 
+            clock.now = 110
             observe(adapter, ADDRESS_A, 110)
             awaitEvent(events) { it is TransportEvent.OpportunityChanged }
             val knownOpportunity = events.filterIsInstance<TransportEvent.OpportunityChanged>()
