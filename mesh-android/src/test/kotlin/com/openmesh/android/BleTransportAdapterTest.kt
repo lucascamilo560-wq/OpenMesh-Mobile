@@ -104,7 +104,7 @@ class BleTransportAdapterTest {
             }
 
             adapter.start()
-            platform.emitScan(ADDRESS_A, seenAtMs = 100)
+            observe(adapter, ADDRESS_A, seenAtMs = 100)
 
             val availableX = events.single() as TransportEvent.OpportunityAvailable
             assertEquals(TransportDirection.SEND_ONLY, availableX.opportunity.direction)
@@ -116,7 +116,7 @@ class BleTransportAdapterTest {
                 availableX.opportunity.address?.copyToByteArray(),
             )
 
-            platform.emitScan(ADDRESS_A, seenAtMs = 120)
+            observe(adapter, ADDRESS_A, seenAtMs = 120)
             val refreshed = events[1] as TransportEvent.OpportunityChanged
             assertEquals(availableX.opportunity.reference, refreshed.previous)
             assertEquals(TransportOpportunityRevision(2), refreshed.opportunity.revision)
@@ -130,7 +130,7 @@ class BleTransportAdapterTest {
             assertEquals(TransportOpportunityUnavailableReason.EXPIRED, expiryEvents.single().reason)
             assertEquals(refreshed.opportunity.reference, expiryEvents.single().opportunity)
 
-            platform.emitScan(ADDRESS_A, seenAtMs = 230)
+            observe(adapter, ADDRESS_A, seenAtMs = 230)
             val availableY = events.filterIsInstance<TransportEvent.OpportunityAvailable>().last()
             assertNotEquals(
                 availableX.opportunity.opportunityId,
@@ -145,7 +145,7 @@ class BleTransportAdapterTest {
             assertEquals(availableY.opportunity.reference, stopped.opportunity)
 
             adapter.start()
-            platform.emitScan(ADDRESS_A, seenAtMs = 250)
+            observe(adapter, ADDRESS_A, seenAtMs = 250)
             val availableZ = events.filterIsInstance<TransportEvent.OpportunityAvailable>().last()
             assertNotEquals(
                 availableY.opportunity.opportunityId,
@@ -180,12 +180,12 @@ class BleTransportAdapterTest {
             }
 
             adapter.start()
-            platform.emitScan(ADDRESS_A, 100)
+            observe(adapter, ADDRESS_A, 100)
             val x = (events.single() as TransportEvent.OpportunityAvailable).opportunity
 
             clock.now = 200
             adapter.expireStaleOpportunities()
-            platform.emitScan(ADDRESS_A, 210)
+            observe(adapter, ADDRESS_A, 210)
             val y = events.filterIsInstance<TransportEvent.OpportunityAvailable>().last().opportunity
             assertNotEquals(x.opportunityId, y.opportunityId)
 
@@ -224,7 +224,7 @@ class BleTransportAdapterTest {
                 adapter.events.collect(events::add)
             }
             adapter.start()
-            platform.emitScan(ADDRESS_A, 100)
+            observe(adapter, ADDRESS_A, 100)
             val revisionOne =
                 (events.single() as TransportEvent.OpportunityAvailable).opportunity.reference
             val arbitraryBytes = byteArrayOf(0x00, 0x7f, 0x55, 0x01, 0x02)
@@ -235,7 +235,7 @@ class BleTransportAdapterTest {
             assertEquals(ADDRESS_A, platform.sent.single().first)
             assertArrayEquals(arbitraryBytes, platform.sent.single().second)
 
-            platform.emitScan(ADDRESS_A, 120)
+            observe(adapter, ADDRESS_A, 120)
             val revisionTwo =
                 events.filterIsInstance<TransportEvent.OpportunityChanged>().last().opportunity.reference
             val stale = adapter.transfer(request(revisionOne, arbitraryBytes, "stale"))
@@ -256,11 +256,11 @@ class BleTransportAdapterTest {
 
             // A second contact becomes current while the write is blocked. The
             // already authorized transfer must remain pinned to address A.
-            platform.emitScan(ADDRESS_B, 130)
+            observe(adapter, ADDRESS_B, 130)
 
             clock.now = 220
             adapter.expireStaleOpportunities()
-            platform.emitScan(ADDRESS_A, 230)
+            observe(adapter, ADDRESS_A, 230)
             releaseSend.complete(Unit)
             assertTrue(inFlight.await() is TransportTransferResult.CompletedLocally)
             assertEquals(listOf(ADDRESS_A, ADDRESS_A), platform.sent.map { it.first })
@@ -318,7 +318,7 @@ class BleTransportAdapterTest {
             )
             assertArrayEquals(invalidEnvelopeBytes, unknownInbound.bytes.copyToByteArray())
 
-            platform.emitScan(ADDRESS_A, 110)
+            observe(adapter, ADDRESS_A, 110)
             yield()
             val knownOpportunity = events.filterIsInstance<TransportEvent.OpportunityChanged>()
                 .last().opportunity
@@ -368,6 +368,20 @@ class BleTransportAdapterTest {
         opportunity = opportunity,
         bytes = bytes,
     )
+
+    private suspend fun observe(
+        adapter: BleTransportAdapter,
+        deviceAddress: String,
+        seenAtMs: Long,
+    ) {
+        adapter.observeAdvertisement(
+            PeerAdvertisement(
+                deviceAddress = deviceAddress,
+                rssi = -55,
+                seenAtMs = seenAtMs,
+            ),
+        )
+    }
 
     private fun resolvedIdentity(seed: Int): ResolvedPeerIdentity = ResolvedPeerIdentity(
         nodeId = MeshNodeId.fromDigest(

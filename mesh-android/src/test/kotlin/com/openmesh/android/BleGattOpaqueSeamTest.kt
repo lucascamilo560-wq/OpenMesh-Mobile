@@ -76,6 +76,7 @@ class BleGattOpaqueSeamTest {
             assertThrows(IllegalArgumentException::class.java) {
                 legacyHandler.prepare(ADDRESS, invalidMagic)
             }
+            Unit
         }
 
     private fun legacyEnvelope(): MeshEnvelope = MeshEnvelope(
