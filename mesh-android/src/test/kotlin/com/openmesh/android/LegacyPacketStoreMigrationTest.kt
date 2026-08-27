@@ -24,7 +24,7 @@ import org.robolectric.annotation.SQLiteMode
 import java.util.UUID
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36], manifest = Config.NONE)
+@Config(sdk = [35], manifest = Config.NONE)
 @SQLiteMode(SQLiteMode.Mode.NATIVE)
 class LegacyPacketStoreMigrationTest {
     private lateinit var context: Context
