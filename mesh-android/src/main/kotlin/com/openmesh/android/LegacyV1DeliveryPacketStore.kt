@@ -229,7 +229,7 @@ private fun hasRecognizedV1Record(
     SELECT 1
     FROM ${DeliverySchema.DELIVERY_RECORDS} records
     WHERE records.delivery_id = ?
-      AND ${recognizedV1Predicate("records.delivery_id")}
+      AND ${recognizedV1RecordPredicate("records.delivery_id")}
     LIMIT 1
     """.trimIndent(),
     arrayOf(deliveryId.value, LegacyV1DeliveryPacketStore.RUNTIME_V1_PROVENANCE),
@@ -242,7 +242,7 @@ private fun loadRecognizedV1Object(
     """
     ${selectV1ObjectSql()}
     WHERE objects.delivery_id = ?
-      AND ${recognizedV1Predicate("objects.delivery_id")}
+      AND ${recognizedV1ObjectPredicate("objects.delivery_id")}
     LIMIT 1
     """.trimIndent(),
     arrayOf(deliveryId.value, LegacyV1DeliveryPacketStore.RUNTIME_V1_PROVENANCE),
@@ -257,7 +257,7 @@ private fun loadRecognizedV1Objects(
     """
     ${selectV1ObjectSql()}
     WHERE records.state = ?
-      AND ${recognizedV1Predicate("objects.delivery_id")}
+      AND ${recognizedV1ObjectPredicate("objects.delivery_id")}
     ORDER BY objects.created_at_ms, objects.delivery_id
     """.trimIndent(),
     arrayOf(state.name, LegacyV1DeliveryPacketStore.RUNTIME_V1_PROVENANCE),
@@ -275,7 +275,7 @@ private fun loadExpiredRecognizedV1Objects(
     ${selectV1ObjectSql()}
     WHERE objects.expires_at_ms <= ?
       AND records.state IN (?, ?)
-      AND ${recognizedV1Predicate("objects.delivery_id")}
+      AND ${recognizedV1ObjectPredicate("objects.delivery_id")}
     ORDER BY objects.delivery_id
     """.trimIndent(),
     arrayOf(
@@ -302,18 +302,45 @@ private fun selectV1ObjectSql(): String = """
       ON records.delivery_id = objects.delivery_id
 """.trimIndent()
 
-private fun recognizedV1Predicate(deliveryIdExpression: String): String = """
+private fun recognizedV1ObjectPredicate(deliveryIdExpression: String): String = """
     (
         EXISTS (
             SELECT 1
             FROM ${DeliverySchema.LEGACY_IMPORT_ITEMS} imported
             WHERE imported.delivery_id = $deliveryIdExpression
+              AND imported.canonical_hash = objects.canonical_hash
         )
         OR EXISTS (
             SELECT 1
             FROM ${DeliverySchema.DELIVERY_PROVENANCE} provenance
             WHERE provenance.delivery_id = $deliveryIdExpression
               AND provenance.reference_value = ?
+        )
+    )
+""".trimIndent()
+
+private fun recognizedV1RecordPredicate(deliveryIdExpression: String): String = """
+    (
+        EXISTS (
+            SELECT 1
+            FROM ${DeliverySchema.DELIVERY_PROVENANCE} provenance
+            WHERE provenance.delivery_id = $deliveryIdExpression
+              AND provenance.reference_value = ?
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM ${DeliverySchema.LEGACY_IMPORT_ITEMS} imported
+            JOIN ${DeliverySchema.DELIVERY_OBJECTS} imported_object
+              ON imported_object.delivery_id = imported.delivery_id
+             AND imported_object.canonical_hash = imported.canonical_hash
+            WHERE imported.delivery_id = $deliveryIdExpression
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM ${DeliverySchema.LEGACY_IMPORT_ITEMS} imported
+            JOIN ${DeliverySchema.TOMBSTONES} retained_tombstone
+              ON retained_tombstone.delivery_id = imported.delivery_id
+            WHERE imported.delivery_id = $deliveryIdExpression
         )
     )
 """.trimIndent()

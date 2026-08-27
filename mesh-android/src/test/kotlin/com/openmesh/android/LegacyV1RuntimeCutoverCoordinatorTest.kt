@@ -2,8 +2,12 @@ package com.openmesh.android
 
 import android.content.Context
 import com.openmesh.core.DeliveryId
+import com.openmesh.core.DeliveryIngest
+import com.openmesh.core.DeliveryObject
 import com.openmesh.core.DeliveryState
+import com.openmesh.core.EndpointId
 import com.openmesh.core.IngestResult
+import com.openmesh.core.IngressProvenance
 import com.openmesh.core.MeshEnvelope
 import com.openmesh.core.MeshRouter
 import com.openmesh.core.NodeId
@@ -275,6 +279,51 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
             ).awaitAll()
 
             assertSame(results[0], results[1])
+            coordinator.close()
+        }
+
+    @Test
+    fun `stale import manifest cannot reinterpret a future generic object after tombstone pruning`() =
+        runBlocking {
+            val packetId = "legacy-pruned-identity"
+            val legacy = SharedPreferencesPacketStore(context, preferencesName)
+            legacy.put(
+                envelope(packetId, REMOTE_NODE_ID, OTHER_NODE_ID).copy(expiresAtMs = 200)
+            )
+            val coordinator = coordinator()
+            val prepared = coordinator.prepare(nowMs = 100)
+
+            assertEquals(1, prepared.packetStore.purgeExpired(nowMs = 200))
+            assertEquals(
+                1,
+                prepared.deliveryStore.pruneExpiredTombstones(nowMs = 1_200, limit = 10),
+            )
+            val generic = DeliveryObject.copyOf(
+                deliveryId = DeliveryId(packetId),
+                destination = EndpointId("dtn://future.example/reused-id"),
+                source = null,
+                createdAtMs = 1_200,
+                expiresAtMs = 5_000,
+                canonicalBytes = byteArrayOf(9, 8, 7),
+            )
+            prepared.deliveryStore.ingest(
+                DeliveryIngest(
+                    deliveryObject = generic,
+                    destinationIsLocal = false,
+                    provenance = IngressProvenance(
+                        IngressProvenance.Kind.REMOTE_PROTOCOL,
+                        "future-profile",
+                    ),
+                ),
+                nowMs = 1_201,
+            )
+
+            assertFalse(prepared.packetStore.contains(packetId))
+            assertFalse(prepared.packetStore.list().any { it.packetId == packetId })
+            assertEquals(
+                DeliveryState.WAITING,
+                prepared.deliveryStore.snapshot(DeliveryId(packetId)).deliveryRecord?.state,
+            )
             coordinator.close()
         }
 
