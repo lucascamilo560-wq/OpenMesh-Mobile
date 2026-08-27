@@ -30,6 +30,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.SQLiteMode
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.UUID
 
 @RunWith(RobolectricTestRunner::class)
@@ -101,6 +103,52 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
             assertFalse(recovered.packetStore.list().any { it.packetId == inbound.packetId })
             assertEquals(sourceBefore, legacyContents())
             restarted.close()
+            expectSuspendThrows(LegacyV1CutoverException::class.java) {
+                restarted.prepare(nowMs = 301)
+            }
+        }
+
+    @Test
+    fun `close during preparation prevents publication and closes the unpublished store`() =
+        runBlocking {
+            val legacy = SharedPreferencesPacketStore(context, preferencesName)
+            legacy.put(envelope("legacy-close-race", REMOTE_NODE_ID, OTHER_NODE_ID))
+            val sourceBefore = legacyContents()
+            val ownerCommitted = CountDownLatch(1)
+            val resumePreparation = CountDownLatch(1)
+            val unpublishedStoreClosed = CountDownLatch(1)
+            val coordinator = coordinator(
+                cutoverHooks = LegacyV1CutoverHooks(
+                    afterOwnerMarkerCommitted = {
+                        ownerCommitted.countDown()
+                        check(resumePreparation.await(5, TimeUnit.SECONDS)) {
+                            "Timed out waiting to resume preparation"
+                        }
+                    },
+                    afterUnpublishedStoreClosed = {
+                        unpublishedStoreClosed.countDown()
+                    },
+                )
+            )
+            val preparing = async(Dispatchers.Default) {
+                coordinator.prepare(nowMs = 100)
+            }
+
+            assertTrue(ownerCommitted.await(5, TimeUnit.SECONDS))
+            coordinator.close()
+            resumePreparation.countDown()
+            expectSuspendThrows(LegacyV1CutoverException::class.java) {
+                preparing.await()
+            }
+
+            assertTrue(unpublishedStoreClosed.await(5, TimeUnit.SECONDS))
+            expectSuspendThrows(LegacyV1CutoverException::class.java) {
+                coordinator.prepare(nowMs = 101)
+            }
+            assertEquals(sourceBefore, legacyContents())
+            val checkpoint = AndroidDeliveryStore(context, databaseName)
+            assertEquals(LegacyV1RuntimeOwner.SQLITE, checkpoint.legacyV1RuntimeOwner())
+            checkpoint.close()
         }
 
     @Test

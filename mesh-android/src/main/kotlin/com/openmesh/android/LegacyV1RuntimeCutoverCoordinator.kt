@@ -49,7 +49,7 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
         "${appContext.packageName}:${appContext.getDatabasePath(databaseName).absolutePath}"
     )
 
-    @Volatile
+    private val lifecycleLock = Any()
     private var closed = false
     private var openedStore: AndroidDeliveryStore? = null
     private var prepared: LegacyV1RuntimePreparation? = null
@@ -84,8 +84,15 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
 
     suspend fun prepare(nowMs: Long = clock()): LegacyV1RuntimePreparation =
         preparationMutex.withLock {
-            check(!closed) { "Legacy v1 cutover coordinator is closed" }
-            prepared?.let { return@withLock it }
+            val existing = synchronized(lifecycleLock) {
+                if (closed) {
+                    throw LegacyV1CutoverException(
+                        "Legacy v1 cutover coordinator is closed"
+                    )
+                }
+                prepared
+            }
+            existing?.let { return@withLock it }
 
             val store = AndroidDeliveryStore(appContext, databaseName)
             try {
@@ -129,11 +136,28 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
                     migrationStatus = migrationStatus,
                     deliveryStore = store,
                 )
-                openedStore = store
-                prepared = result
+                val published = synchronized(lifecycleLock) {
+                    if (closed) {
+                        false
+                    } else {
+                        openedStore = store
+                        prepared = result
+                        true
+                    }
+                }
+                if (!published) {
+                    throw LegacyV1CutoverException(
+                        "Legacy v1 cutover coordinator closed before preparation publication"
+                    )
+                }
                 result
             } catch (failure: Throwable) {
-                store.close()
+                try {
+                    store.close()
+                    cutoverHooks.afterUnpublishedStoreClosed()
+                } catch (closeFailure: Throwable) {
+                    failure.addSuppressed(closeFailure)
+                }
                 throw failure
             }
         }
@@ -158,13 +182,13 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
     }
 
     override fun close() {
-        synchronized(this) {
-            if (closed) return
+        val storeToClose = synchronized(lifecycleLock) {
+            if (closed) return@synchronized null
             closed = true
             prepared = null
-            openedStore?.close()
-            openedStore = null
+            openedStore.also { openedStore = null }
         }
+        storeToClose?.close()
     }
 
     private companion object {
@@ -178,6 +202,7 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
 internal data class LegacyV1CutoverHooks(
     val beforeOwnerMarker: () -> Unit = {},
     val afterOwnerMarkerCommitted: () -> Unit = {},
+    val afterUnpublishedStoreClosed: () -> Unit = {},
 )
 
 internal suspend fun AndroidDeliveryStore.legacyV1RuntimeOwner(): LegacyV1RuntimeOwner? =
