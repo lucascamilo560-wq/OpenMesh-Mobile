@@ -26,11 +26,11 @@ class LegacyV1DeliveryPacketStore internal constructor(
     private val store: AndroidDeliveryStore,
     val localNodeId: NodeId,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val tombstoneRetentionMs: Long = DEFAULT_TOMBSTONE_RETENTION_MS,
+    private val tombstoneReplayGuardMs: Long = DEFAULT_REPLAY_GUARD_MS,
 ) : PacketStore {
 
     init {
-        require(tombstoneRetentionMs > 0) { "Tombstone retention must be positive" }
+        requireLegacyV1ReplayGuard(tombstoneReplayGuardMs)
     }
 
     override suspend fun contains(packetId: String): Boolean {
@@ -48,6 +48,7 @@ class LegacyV1DeliveryPacketStore internal constructor(
         val deliveryObject = legacyV1DeliveryObject(packet, canonicalBytes)
         val provenance = runtimeV1Provenance(packet, localNodeId)
         val nowMs = clock()
+        pruneExpiredTombstones(nowMs)
 
         store.writeForLegacyV1Runtime { transaction ->
             val database = transaction.database
@@ -64,7 +65,11 @@ class LegacyV1DeliveryPacketStore internal constructor(
                     deliveryObject = deliveryObject,
                     provenance = provenance,
                     nowMs = nowMs,
-                    tombstoneExpiresAtMs = retainedUntil(nowMs),
+                    tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                        packetExpiresAtMs = packet.expiresAtMs,
+                        nowMs = nowMs,
+                        replayGuardMs = tombstoneReplayGuardMs,
+                    ),
                 )
                 return@writeForLegacyV1Runtime
             }
@@ -104,6 +109,7 @@ class LegacyV1DeliveryPacketStore internal constructor(
     override suspend fun remove(packetId: String) {
         val deliveryId = runCatching { DeliveryId(packetId) }.getOrNull() ?: return
         val nowMs = clock()
+        pruneExpiredTombstones(nowMs)
         store.writeForLegacyV1Runtime { transaction ->
             val row = loadRecognizedV1Object(transaction.database, deliveryId) ?: return@writeForLegacyV1Runtime
             val envelope = row.decodeAndValidate(localNodeId, permitLocal = true)
@@ -113,7 +119,11 @@ class LegacyV1DeliveryPacketStore internal constructor(
                 provenance = runtimeV1Provenance(envelope, localNodeId),
                 nowMs = nowMs,
                 tombstoneReason = TombstoneReason.EXPLICITLY_REMOVED,
-                tombstoneExpiresAtMs = retainedUntil(nowMs),
+                tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                    packetExpiresAtMs = envelope.expiresAtMs,
+                    nowMs = nowMs,
+                    replayGuardMs = tombstoneReplayGuardMs,
+                ),
                 emitExpiredEvent = false,
             )
         }
@@ -129,8 +139,8 @@ class LegacyV1DeliveryPacketStore internal constructor(
             .map { row -> row.decodeAndValidate(localNodeId, permitLocal = false) }
     }
 
-    override suspend fun purgeExpired(nowMs: Long): Int =
-        store.writeForLegacyV1Runtime { transaction ->
+    override suspend fun purgeExpired(nowMs: Long): Int {
+        val expiredCount = store.writeForLegacyV1Runtime { transaction ->
             val expired = loadExpiredRecognizedV1Objects(transaction.database, nowMs)
             expired.forEach { row ->
                 val envelope = row.decodeAndValidate(localNodeId, permitLocal = true)
@@ -139,21 +149,56 @@ class LegacyV1DeliveryPacketStore internal constructor(
                     deliveryObject = legacyV1DeliveryObject(envelope, row.canonicalBytes),
                     provenance = runtimeV1Provenance(envelope, localNodeId),
                     nowMs = nowMs,
-                    tombstoneExpiresAtMs = retainedUntil(nowMs),
+                    tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                        packetExpiresAtMs = envelope.expiresAtMs,
+                        nowMs = nowMs,
+                        replayGuardMs = tombstoneReplayGuardMs,
+                    ),
                 )
             }
             expired.size
         }
+        pruneExpiredTombstones(nowMs)
+        return expiredCount
+    }
 
-    private fun retainedUntil(nowMs: Long): Long =
-        if (Long.MAX_VALUE - nowMs < tombstoneRetentionMs) Long.MAX_VALUE
-        else nowMs + tombstoneRetentionMs
+    internal suspend fun pruneExpiredTombstones(nowMs: Long): Int {
+        val batchSize = store.configuredLimits.maxOutboxReadBatch
+        var total = 0
+        do {
+            val pruned = store.pruneExpiredTombstones(nowMs, batchSize)
+            total += pruned
+        } while (pruned == batchSize)
+        return total
+    }
 
     companion object {
-        /** Conservative until the production cutover supplies an explicit retention policy. */
-        const val DEFAULT_TOMBSTONE_RETENTION_MS = Long.MAX_VALUE
+        const val DEFAULT_REPLAY_GUARD_MS = BleMeshNode.DEFAULT_TTL_MS
+        const val MAX_REPLAY_GUARD_MS = 30L * 24L * 60L * 60L * 1000L
         internal const val RUNTIME_V1_PROVENANCE = "legacy-v1-runtime:mesh-envelope-v1"
     }
+}
+
+internal fun requireLegacyV1ReplayGuard(replayGuardMs: Long) {
+    require(replayGuardMs in 1..LegacyV1DeliveryPacketStore.MAX_REPLAY_GUARD_MS) {
+        "Legacy v1 replay guard must be between 1 and " +
+            "${LegacyV1DeliveryPacketStore.MAX_REPLAY_GUARD_MS} ms"
+    }
+}
+
+internal fun legacyV1TombstoneExpiresAt(
+    packetExpiresAtMs: Long,
+    nowMs: Long,
+    replayGuardMs: Long,
+): Long {
+    requireLegacyV1ReplayGuard(replayGuardMs)
+    val retentionAnchor = maxOf(packetExpiresAtMs, nowMs)
+    if (retentionAnchor > Long.MAX_VALUE - replayGuardMs) {
+        throw LegacyV1PacketStoreException(
+            "Legacy v1 tombstone expiry exceeds the supported timestamp range"
+        )
+    }
+    return retentionAnchor + replayGuardMs
 }
 
 class LegacyV1PacketStoreException(message: String, cause: Throwable? = null) :

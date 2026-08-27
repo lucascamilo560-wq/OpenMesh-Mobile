@@ -39,7 +39,7 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
     private val localNodeId: NodeId,
     private val databaseName: String,
     private val legacyPreferencesName: String,
-    private val tombstoneRetentionMs: Long,
+    private val tombstoneReplayGuardMs: Long,
     private val clock: () -> Long,
     private val migrationHooks: LegacyMigrationHooks,
     private val cutoverHooks: LegacyV1CutoverHooks,
@@ -61,14 +61,14 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
         databaseName: String = AndroidDeliveryStore.DEFAULT_DATABASE_NAME,
         legacyPreferencesName: String =
             LegacyPacketStoreMigrator.DEFAULT_LEGACY_PREFERENCES_NAME,
-        tombstoneRetentionMs: Long =
-            LegacyV1DeliveryPacketStore.DEFAULT_TOMBSTONE_RETENTION_MS,
+        tombstoneReplayGuardMs: Long =
+            LegacyV1DeliveryPacketStore.DEFAULT_REPLAY_GUARD_MS,
     ) : this(
         context = context,
         localNodeId = localNodeId,
         databaseName = databaseName,
         legacyPreferencesName = legacyPreferencesName,
-        tombstoneRetentionMs = tombstoneRetentionMs,
+        tombstoneReplayGuardMs = tombstoneReplayGuardMs,
         clock = System::currentTimeMillis,
         migrationHooks = LegacyMigrationHooks(),
         cutoverHooks = LegacyV1CutoverHooks(),
@@ -79,7 +79,7 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
         require(legacyPreferencesName.isNotBlank()) {
             "Legacy preferences name must not be blank"
         }
-        require(tombstoneRetentionMs > 0) { "Tombstone retention must be positive" }
+        requireLegacyV1ReplayGuard(tombstoneReplayGuardMs)
     }
 
     suspend fun prepare(nowMs: Long = clock()): LegacyV1RuntimePreparation =
@@ -106,6 +106,7 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
                         ),
                         migrationId = LegacyPacketStoreMigrator.DEFAULT_MIGRATION_ID,
                         localNodeId = localNodeId,
+                        tombstoneReplayGuardMs = tombstoneReplayGuardMs,
                         hooks = migrationHooks,
                     ).migrate(nowMs)
                     val retained = requireRetainedMigration(report.status)
@@ -125,13 +126,20 @@ class LegacyV1RuntimeCutoverCoordinator internal constructor(
                     )
                 }
 
+                store.normalizeInfiniteImportedLegacyV1Tombstones(
+                    migrationId = LegacyPacketStoreMigrator.DEFAULT_MIGRATION_ID,
+                    nowMs = nowMs,
+                    replayGuardMs = tombstoneReplayGuardMs,
+                )
+                val packetStore = LegacyV1DeliveryPacketStore(
+                    store = store,
+                    localNodeId = localNodeId,
+                    clock = clock,
+                    tombstoneReplayGuardMs = tombstoneReplayGuardMs,
+                )
+                packetStore.pruneExpiredTombstones(nowMs)
                 val result = LegacyV1RuntimePreparation(
-                    packetStore = LegacyV1DeliveryPacketStore(
-                        store = store,
-                        localNodeId = localNodeId,
-                        clock = clock,
-                        tombstoneRetentionMs = tombstoneRetentionMs,
-                    ),
+                    packetStore = packetStore,
                     owner = LegacyV1RuntimeOwner.SQLITE,
                     migrationStatus = migrationStatus,
                     deliveryStore = store,

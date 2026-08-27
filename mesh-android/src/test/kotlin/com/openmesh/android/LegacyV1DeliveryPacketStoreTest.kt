@@ -251,12 +251,78 @@ class LegacyV1DeliveryPacketStoreTest {
         store.close()
     }
 
+    @Test
+    fun `tombstones follow envelope expiry plus replay guard and pruning keeps purge count honest`() =
+        runBlocking {
+            var store = AndroidDeliveryStore(context, databaseName)
+            var bridge = bridge(store)
+            val expiresNow = envelope(
+                id = "v1-finite-expiry",
+                source = REMOTE_NODE_ID,
+                destination = OTHER_NODE_ID,
+                expiresAtMs = 200,
+            )
+            val removedBeforeExpiry = envelope(
+                id = "v1-future-expiry",
+                source = REMOTE_NODE_ID,
+                destination = OTHER_NODE_ID,
+                expiresAtMs = 5_000,
+            )
+            bridge.put(expiresNow)
+            bridge.put(removedBeforeExpiry)
+            bridge.remove(removedBeforeExpiry.packetId)
+
+            assertEquals(
+                6_000,
+                store.snapshot(DeliveryId(removedBeforeExpiry.packetId)).tombstone?.expiresAtMs,
+            )
+            nowMs = 200
+            assertEquals(1, bridge.purgeExpired(nowMs))
+            assertEquals(
+                1_200,
+                store.snapshot(DeliveryId(expiresNow.packetId)).tombstone?.expiresAtMs,
+            )
+            store.close()
+
+            nowMs = 1_200
+            store = AndroidDeliveryStore(context, databaseName)
+            bridge = bridge(store)
+            assertEquals(0, bridge.purgeExpired(nowMs))
+            assertNull(store.snapshot(DeliveryId(expiresNow.packetId)).deliveryRecord)
+            assertNotNull(
+                store.snapshot(DeliveryId(removedBeforeExpiry.packetId)).tombstone
+            )
+            store.close()
+        }
+
+    @Test
+    fun `admission opportunistically prunes expired tombstones`() = runBlocking {
+        nowMs = 100
+        val store = AndroidDeliveryStore(context, databaseName)
+        val bridge = bridge(store)
+        val alreadyExpired = envelope(
+            id = "v1-prune-before-admission",
+            source = REMOTE_NODE_ID,
+            destination = OTHER_NODE_ID,
+            expiresAtMs = 99,
+        )
+        bridge.put(alreadyExpired)
+        assertNotNull(store.snapshot(DeliveryId(alreadyExpired.packetId)).tombstone)
+
+        nowMs = 1_100
+        bridge.put(envelope("v1-after-prune", LOCAL_NODE_ID, REMOTE_NODE_ID))
+
+        assertNull(store.snapshot(DeliveryId(alreadyExpired.packetId)).deliveryRecord)
+        assertTrue(bridge.contains("v1-after-prune"))
+        store.close()
+    }
+
     private fun bridge(store: AndroidDeliveryStore): LegacyV1DeliveryPacketStore =
         LegacyV1DeliveryPacketStore(
             store = store,
             localNodeId = LOCAL_NODE_ID,
             clock = { nowMs },
-            tombstoneRetentionMs = 1_000,
+            tombstoneReplayGuardMs = 1_000,
         )
 
     private fun envelope(

@@ -376,6 +376,49 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
         }
 
     @Test
+    fun `legacy infinite imported tombstone is normalized once and survives restart finitely`() =
+        runBlocking {
+            val packetId = "legacy-infinite-tombstone"
+            val legacy = SharedPreferencesPacketStore(context, preferencesName)
+            legacy.put(
+                envelope(packetId, REMOTE_NODE_ID, OTHER_NODE_ID).copy(expiresAtMs = 99)
+            )
+            val first = coordinator()
+            val initiallyPrepared = first.prepare(nowMs = 100)
+            assertEquals(
+                1_100,
+                initiallyPrepared.deliveryStore.snapshot(DeliveryId(packetId))
+                    .tombstone?.expiresAtMs,
+            )
+            initiallyPrepared.deliveryStore.writeForLegacyV1Runtime { transaction ->
+                transaction.database.execSQL(
+                    "UPDATE ${DeliverySchema.TOMBSTONES} SET expires_at_ms = ? " +
+                        "WHERE delivery_id = ?",
+                    arrayOf(Long.MAX_VALUE, packetId),
+                )
+                transaction.markChanged()
+            }
+            first.close()
+
+            val normalized = coordinator()
+            val normalizedPreparation = normalized.prepare(nowMs = 500)
+            assertEquals(
+                1_500,
+                normalizedPreparation.deliveryStore.snapshot(DeliveryId(packetId))
+                    .tombstone?.expiresAtMs,
+            )
+            normalized.close()
+
+            val restarted = coordinator()
+            val recovered = restarted.prepare(nowMs = 700)
+            assertEquals(
+                1_500,
+                recovered.deliveryStore.snapshot(DeliveryId(packetId)).tombstone?.expiresAtMs,
+            )
+            restarted.close()
+        }
+
+    @Test
     fun `malformed migration fails before ownership and leaves SharedPreferences byte exact`() =
         runBlocking {
             val preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
@@ -408,7 +451,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
         localNodeId = localNodeId,
         databaseName = databaseName,
         legacyPreferencesName = preferencesName,
-        tombstoneRetentionMs = 1_000,
+        tombstoneReplayGuardMs = 1_000,
         clock = { 100L },
         migrationHooks = migrationHooks,
         cutoverHooks = cutoverHooks,

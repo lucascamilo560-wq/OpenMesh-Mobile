@@ -14,6 +14,12 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import com.openmesh.core.NodeId
+import com.openmesh.core.PacketStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 /**
  * Foreground lifecycle host for a continuously participating OpenMesh node.
@@ -26,14 +32,14 @@ import android.os.IBinder
  */
 class MeshNodeService : Service() {
     private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var radioGuard: MeshRadioGuard
-    private var node: BleMeshNode? = null
-    private var nodeId: String? = null
+    private lateinit var runtime: MeshNodeServiceRuntime
     private var receiverRegistered = false
 
     inner class LocalBinder : Binder() {
         fun service(): MeshNodeService = this@MeshNodeService
-        fun node(): BleMeshNode? = this@MeshNodeService.node
+        fun node(): BleMeshNode? = currentNode()
     }
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
@@ -51,6 +57,19 @@ class MeshNodeService : Service() {
     override fun onCreate() {
         super.onCreate()
         radioGuard = MeshRadioGuard(applicationContext)
+        runtime = MeshNodeServiceRuntime(
+            scope = serviceScope,
+            preparationDispatcher = Dispatchers.IO,
+            radioSnapshot = radioGuard::snapshot,
+            coordinatorFactory = { nodeId ->
+                productionLegacyV1CutoverHandle(applicationContext, nodeId)
+            },
+            nodeFactory = ::createNode,
+            persistNodeId = { nodeId ->
+                preferences().edit().putString(PREF_NODE_ID, nodeId.value).commit()
+            },
+            publishStatus = ::publishRuntimeStatus,
+        )
         ensureNotificationChannel()
         registerBluetoothReceiver()
     }
@@ -63,102 +82,95 @@ class MeshNodeService : Service() {
             return START_NOT_STICKY
         }
 
-        val requestedNodeId = intent?.getStringExtra(EXTRA_NODE_ID)
+        val requestedNodeIdValue = intent?.getStringExtra(EXTRA_NODE_ID)
             ?: preferences().getString(PREF_NODE_ID, null)
 
-        if (requestedNodeId.isNullOrBlank()) {
+        if (requestedNodeIdValue.isNullOrBlank()) {
             stopSelf()
             return START_NOT_STICKY
         }
 
-        nodeId = requestedNodeId
-        preferences().edit().putString(PREF_NODE_ID, requestedNodeId).apply()
         showForeground("OpenMesh iniciando…")
-        attemptResume()
+        val requestedNodeId = runCatching { NodeId(requestedNodeIdValue) }.getOrNull()
+        if (requestedNodeId == null) {
+            updateNotification("Mesh pausada: identidade de nó inválida")
+            if (!runtime.hasRuntime) stopSelf()
+            return START_NOT_STICKY
+        }
+        runtime.requestStart(requestedNodeId)
         return START_STICKY
     }
 
     override fun onDestroy() {
-        node?.close()
-        node = null
+        runtime.shutdown()
         unregisterBluetoothReceiver()
+        serviceScope.cancel()
         super.onDestroy()
     }
 
-    fun currentNode(): BleMeshNode? = node
+    fun currentNode(): BleMeshNode? = runtime.exposedNode
 
     private fun attemptResume() {
-        val currentNodeId = nodeId ?: return
-        val snapshot = radioGuard.snapshot()
-
-        when {
-            !snapshot.bluetoothAvailable -> {
-                node?.stop()
-                updateNotification("Bluetooth indisponível neste aparelho")
-            }
-
-            snapshot.missingBlePermissions.isNotEmpty() -> {
-                node?.stop()
-                updateNotification("Permissão necessária — toque para ativar a mesh")
-            }
-
-            !snapshot.bluetoothEnabled -> {
-                node?.stop()
-                updateNotification("Bluetooth desligado — toque para reativar")
-            }
-
-            !snapshot.bleAdvertisingSupported -> {
-                node?.stop()
-                updateNotification("Anúncio BLE não suportado neste aparelho")
-            }
-
-            else -> {
-                val activeNode = node ?: createNode(currentNodeId).also {
-                    node = it
-                }
-                when (val result = activeNode.start()) {
-                    MeshNodeStartResult.Started -> updateNotification("OpenMesh ativo — procurando outros nós")
-                    is MeshNodeStartResult.PermissionsRequired ->
-                        updateNotification("Permissão necessária — toque para ativar a mesh")
-                    MeshNodeStartResult.BluetoothDisabled ->
-                        updateNotification("Bluetooth desligado — toque para reativar")
-                    MeshNodeStartResult.BluetoothUnavailable ->
-                        updateNotification("Bluetooth indisponível neste aparelho")
-                    MeshNodeStartResult.AdvertisingUnsupported ->
-                        updateNotification("Anúncio BLE não suportado neste aparelho")
-                    is MeshNodeStartResult.TransportFailure ->
-                        updateNotification("Mesh pausada: falha em ${result.component}")
-                }
-            }
-        }
+        runtime.onBluetoothOn()
     }
 
-    private fun createNode(currentNodeId: String): BleMeshNode {
+    private fun createNode(
+        currentNodeId: NodeId,
+        store: PacketStore,
+    ): MeshNodeRuntimeHandle {
         // Default integrations can expose their public key automatically. Hosts
         // using a custom identity may still create BleMeshNode directly.
         val identity = runCatching { AndroidMeshIdentityStore(applicationContext).loadOrCreate() }
             .getOrNull()
-            ?.takeIf { it.nodeId == currentNodeId }
+            ?.takeIf { it.nodeId == currentNodeId.value }
 
-        return BleMeshNode(
+        val node = BleMeshNode(
             context = applicationContext,
-            localNodeId = currentNodeId,
+            localNodeId = currentNodeId.value,
+            store = store,
             localIdentity = identity,
         )
+        return object : MeshNodeRuntimeHandle {
+            override val exposedNode: BleMeshNode = node
+            override fun start(): MeshNodeStartResult = node.start()
+            override fun stop() = node.stop()
+            override fun close() = node.close()
+        }
     }
 
     private fun pauseForRadioOff() {
-        node?.stop()
-        updateNotification("Bluetooth desligado — toque para reativar")
+        runtime.onBluetoothOff()
     }
 
     private fun stopNodeAndService() {
-        node?.close()
-        node = null
-        nodeId = null
-        preferences().edit().remove(PREF_NODE_ID).apply()
+        runtime.shutdown()
+        preferences().edit().remove(PREF_NODE_ID).commit()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun publishRuntimeStatus(status: MeshNodeRuntimeStatus) {
+        val message = when (status) {
+            MeshNodeRuntimeStatus.PreparingStorage -> "OpenMesh preparando armazenamento seguro…"
+            MeshNodeRuntimeStatus.Active -> "OpenMesh ativo — procurando outros nós"
+            MeshNodeRuntimeStatus.BluetoothUnavailable ->
+                "Bluetooth indisponível neste aparelho"
+            MeshNodeRuntimeStatus.BluetoothDisabled ->
+                "Bluetooth desligado — toque para reativar"
+            MeshNodeRuntimeStatus.PermissionsRequired ->
+                "Permissão necessária — toque para ativar a mesh"
+            MeshNodeRuntimeStatus.AdvertisingUnsupported ->
+                "Anúncio BLE não suportado neste aparelho"
+            MeshNodeRuntimeStatus.CutoverFailed ->
+                "Mesh pausada: armazenamento transacional indisponível"
+            MeshNodeRuntimeStatus.IdentityPersistenceFailed ->
+                "Mesh pausada: identidade não pôde ser confirmada"
+            MeshNodeRuntimeStatus.NodeIdentityMismatch ->
+                "OpenMesh mantém a identidade atual — troca de nó recusada"
+            is MeshNodeRuntimeStatus.TransportFailure ->
+                "Mesh pausada: falha em ${status.component}"
+        }
+        updateNotification(message)
     }
 
     private fun ensureNotificationChannel() {

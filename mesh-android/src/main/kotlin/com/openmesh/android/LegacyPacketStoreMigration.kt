@@ -69,6 +69,8 @@ class LegacyPacketStoreMigrator internal constructor(
     private val source: LegacyPacketSource,
     private val migrationId: String,
     private val localNodeId: NodeId,
+    private val tombstoneReplayGuardMs: Long =
+        LegacyV1DeliveryPacketStore.DEFAULT_REPLAY_GUARD_MS,
     private val hooks: LegacyMigrationHooks,
 ) {
 
@@ -79,11 +81,14 @@ class LegacyPacketStoreMigrator internal constructor(
         localNodeId: NodeId,
         legacyPreferencesName: String = DEFAULT_LEGACY_PREFERENCES_NAME,
         migrationId: String = DEFAULT_MIGRATION_ID,
+        tombstoneReplayGuardMs: Long =
+            LegacyV1DeliveryPacketStore.DEFAULT_REPLAY_GUARD_MS,
     ) : this(
         store = store,
         source = SharedPreferencesLegacyPacketSource(context, legacyPreferencesName),
         migrationId = migrationId,
         localNodeId = localNodeId,
+        tombstoneReplayGuardMs = tombstoneReplayGuardMs,
         hooks = LegacyMigrationHooks(),
     )
 
@@ -92,6 +97,7 @@ class LegacyPacketStoreMigrator internal constructor(
         require(migrationId.encodeToByteArray().size <= MAX_MIGRATION_ID_BYTES) {
             "Legacy migration ID exceeds $MAX_MIGRATION_ID_BYTES bytes"
         }
+        requireLegacyV1ReplayGuard(tombstoneReplayGuardMs)
     }
 
     suspend fun status(): LegacyMigrationStatus? = store.legacyMigrationStatus(migrationId)
@@ -116,6 +122,7 @@ class LegacyPacketStoreMigrator internal constructor(
                     entry = entry,
                     localNodeId = localNodeId,
                     nowMs = nowMs,
+                    tombstoneReplayGuardMs = tombstoneReplayGuardMs,
                 )
                 hooks.afterEntryCommitted(entry.legacyKey)
             }
@@ -462,6 +469,7 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     entry: LegacyPacketEntry,
     localNodeId: NodeId,
     nowMs: Long,
+    tombstoneReplayGuardMs: Long,
 ): Boolean = writeForLegacyMigration { transaction ->
     val database = transaction.database
     val metadata = loadMigrationStatus(database, migrationId)
@@ -493,7 +501,17 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     )
     val expired = entry.envelope.expiresAtMs <= nowMs
     if (expired) {
-        storeExpiredLegacyV1Delivery(transaction, deliveryObject, provenance, nowMs)
+        storeExpiredLegacyV1Delivery(
+            transaction = transaction,
+            deliveryObject = deliveryObject,
+            provenance = provenance,
+            nowMs = nowMs,
+            tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                packetExpiresAtMs = entry.envelope.expiresAtMs,
+                nowMs = nowMs,
+                replayGuardMs = tombstoneReplayGuardMs,
+            ),
+        )
     } else {
         when (disposition) {
             LegacyDeliveryDisposition.LOCAL_QUARANTINED ->
@@ -662,7 +680,7 @@ internal fun AndroidDeliveryStore.storeExpiredLegacyV1Delivery(
     provenance: IngressProvenance,
     nowMs: Long,
     tombstoneReason: TombstoneReason = TombstoneReason.EXPIRED,
-    tombstoneExpiresAtMs: Long = Long.MAX_VALUE,
+    tombstoneExpiresAtMs: Long,
     emitExpiredEvent: Boolean = true,
 ) {
     require(tombstoneExpiresAtMs > nowMs) {
@@ -764,6 +782,62 @@ internal fun AndroidDeliveryStore.storeExpiredLegacyV1Delivery(
             nowMs,
         )
     }
+}
+
+internal suspend fun AndroidDeliveryStore.normalizeInfiniteImportedLegacyV1Tombstones(
+    migrationId: String,
+    nowMs: Long,
+    replayGuardMs: Long,
+): Int = writeForLegacyV1Runtime { transaction ->
+    requireLegacyV1ReplayGuard(replayGuardMs)
+    val metadata = loadMigrationStatus(transaction.database, migrationId)
+        ?: throw LegacyMigrationVerificationException("Missing migration metadata $migrationId")
+    if (metadata.state != LegacyMigrationState.LEGACY_RETAINED) {
+        throw LegacyMigrationVerificationException(
+            "Cannot normalize tombstones while migration is ${metadata.state}"
+        )
+    }
+    val tombstones = transaction.database.rawQuery(
+        """
+        SELECT tombstones.delivery_id, tombstones.created_at_ms
+        FROM ${DeliverySchema.TOMBSTONES} tombstones
+        JOIN ${DeliverySchema.LEGACY_IMPORT_ITEMS} imported
+          ON imported.delivery_id = tombstones.delivery_id
+        WHERE imported.migration_id = ?
+          AND imported.expired_at_import = 1
+          AND tombstones.expires_at_ms = ?
+        ORDER BY tombstones.delivery_id
+        """.trimIndent(),
+        arrayOf(migrationId, Long.MAX_VALUE.toString()),
+    ).use { cursor ->
+        buildList {
+            while (cursor.moveToNext()) {
+                add(cursor.getString(0) to cursor.getLong(1))
+            }
+        }
+    }
+    tombstones.forEach { (deliveryId, createdAtMs) ->
+        val values = ContentValues().apply {
+            put(
+                "expires_at_ms",
+                legacyV1TombstoneExpiresAt(
+                    packetExpiresAtMs = createdAtMs,
+                    nowMs = nowMs,
+                    replayGuardMs = replayGuardMs,
+                ),
+            )
+        }
+        check(
+            transaction.database.update(
+                DeliverySchema.TOMBSTONES,
+                values,
+                "delivery_id = ? AND expires_at_ms = ?",
+                arrayOf(deliveryId, Long.MAX_VALUE.toString()),
+            ) == 1
+        )
+    }
+    if (tombstones.isNotEmpty()) transaction.markChanged()
+    tombstones.size
 }
 
 private suspend fun AndroidDeliveryStore.verifyLegacyImport(
