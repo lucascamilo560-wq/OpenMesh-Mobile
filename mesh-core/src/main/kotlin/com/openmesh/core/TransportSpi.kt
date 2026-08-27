@@ -35,6 +35,22 @@ value class TransportOpportunityId(val value: String) {
     }
 }
 
+/**
+ * Monotonic generation of one adapter-scoped opportunity ID.
+ *
+ * The revision is meaningful only together with [TransportOpportunityKey].
+ * Adapters must advance it before publishing any changed observation. A stale
+ * revision can never be resolved as the current opportunity implicitly.
+ */
+@JvmInline
+value class TransportOpportunityRevision(val value: Long) {
+    init {
+        require(value > 0) { "Transport opportunity revision must be positive" }
+    }
+
+    override fun toString(): String = value.toString()
+}
+
 /** Correlation identity created for one local invocation of [TransportAdapter.transfer]. */
 @JvmInline
 value class TransportTransferId(val value: String) {
@@ -117,16 +133,33 @@ data class TransportOpportunityKey(
     val opportunityId: TransportOpportunityId,
 )
 
+/** Exact revision of the local fact approved for one transfer. */
+data class TransportOpportunityReference(
+    val key: TransportOpportunityKey,
+    val revision: TransportOpportunityRevision,
+) {
+    val adapterId: TransportAdapterId
+        get() = key.adapterId
+
+    val opportunityId: TransportOpportunityId
+        get() = key.opportunityId
+}
+
 /**
  * Temporary local fact emitted by an adapter. It is never a route.
  *
  * [validUntilMs] is exclusive and every opportunity is deliberately bounded.
+ * [revision] identifies this exact observation snapshot independently from its
+ * freshness window. Every [TransportEvent.OpportunityChanged] advances the
+ * revision, including a freshness refresh, so an old decision always fails
+ * closed instead of inheriting changed peer, address, direction, or validity.
  * Longer-lived predictions/contact plans require a future, explicit extension
  * instead of turning this observation into permanent routing state.
  */
 data class TransportOpportunity(
     val adapterId: TransportAdapterId,
     val opportunityId: TransportOpportunityId,
+    val revision: TransportOpportunityRevision,
     val observedAtMs: Long,
     val validUntilMs: Long,
     val direction: TransportDirection,
@@ -148,6 +181,9 @@ data class TransportOpportunity(
 
     val key: TransportOpportunityKey
         get() = TransportOpportunityKey(adapterId, opportunityId)
+
+    val reference: TransportOpportunityReference
+        get() = TransportOpportunityReference(key, revision)
 
     fun isFreshAt(nowMs: Long): Boolean =
         nowMs >= observedAtMs && nowMs < validUntilMs
@@ -179,9 +215,23 @@ sealed interface TransportEvent {
             get() = opportunity.observedAtMs
     }
 
+    /**
+     * Replaces one currently observed revision with a strictly newer snapshot.
+     * Adapters use this event for every change, including validity-only refresh.
+     */
     data class OpportunityChanged(
+        val previous: TransportOpportunityReference,
         val opportunity: TransportOpportunity,
     ) : TransportEvent {
+        init {
+            require(previous.key == opportunity.key) {
+                "Opportunity change must preserve its adapter-scoped ID"
+            }
+            require(opportunity.revision.value > previous.revision.value) {
+                "Opportunity change must advance its revision"
+            }
+        }
+
         override val adapterId: TransportAdapterId
             get() = opportunity.adapterId
         override val occurredAtMs: Long
@@ -189,11 +239,13 @@ sealed interface TransportEvent {
     }
 
     data class OpportunityUnavailable(
-        override val adapterId: TransportAdapterId,
-        val opportunityId: TransportOpportunityId,
+        val opportunity: TransportOpportunityReference,
         override val occurredAtMs: Long,
         val reason: TransportOpportunityUnavailableReason,
     ) : TransportEvent {
+        override val adapterId: TransportAdapterId
+            get() = opportunity.adapterId
+
         init {
             require(occurredAtMs >= 0) { "Opportunity event time must not be negative" }
         }
@@ -207,7 +259,7 @@ sealed interface TransportEvent {
      */
     data class InboundBytes(
         override val adapterId: TransportAdapterId,
-        val opportunityId: TransportOpportunityId?,
+        val opportunity: TransportOpportunityReference?,
         val peer: TransportPeer,
         val sourceAddress: TransportAddress?,
         override val occurredAtMs: Long,
@@ -219,6 +271,9 @@ sealed interface TransportEvent {
             require(bytes.size <= TransportContractLimits.MAX_OPAQUE_BYTES) {
                 "Inbound transport bytes exceed ${TransportContractLimits.MAX_OPAQUE_BYTES} bytes"
             }
+            require(opportunity == null || opportunity.adapterId == adapterId) {
+                "Inbound opportunity belongs to a different adapter"
+            }
             require(sourceAddress == null || sourceAddress.adapterId == adapterId) {
                 "Inbound transport address belongs to a different adapter"
             }
@@ -227,14 +282,14 @@ sealed interface TransportEvent {
         companion object {
             fun copyOf(
                 adapterId: TransportAdapterId,
-                opportunityId: TransportOpportunityId? = null,
+                opportunity: TransportOpportunityReference? = null,
                 peer: TransportPeer = TransportPeer.Unknown,
                 sourceAddress: TransportAddress? = null,
                 occurredAtMs: Long,
                 bytes: ByteArray,
             ): InboundBytes = InboundBytes(
                 adapterId = adapterId,
-                opportunityId = opportunityId,
+                opportunity = opportunity,
                 peer = peer,
                 sourceAddress = sourceAddress,
                 occurredAtMs = occurredAtMs,
@@ -258,7 +313,7 @@ object TransportContractLimits {
  */
 data class TransportTransferRequest(
     val transferId: TransportTransferId,
-    val opportunity: TransportOpportunityKey,
+    val opportunity: TransportOpportunityReference,
     val bytes: OpaqueBytes,
 ) {
     init {
@@ -271,7 +326,7 @@ data class TransportTransferRequest(
     companion object {
         fun copyOf(
             transferId: TransportTransferId,
-            opportunity: TransportOpportunityKey,
+            opportunity: TransportOpportunityReference,
             bytes: ByteArray,
         ): TransportTransferRequest = TransportTransferRequest(
             transferId = transferId,
@@ -332,7 +387,7 @@ sealed interface TransportTransferResult {
     data class OpportunityUnavailable(
         override val transferId: TransportTransferId,
         override val occurredAtMs: Long,
-        val opportunity: TransportOpportunityKey,
+        val opportunity: TransportOpportunityReference,
     ) : TransportTransferResult {
         init {
             require(occurredAtMs >= 0) { "Transfer result time must not be negative" }
@@ -367,6 +422,12 @@ interface TransportAdapter {
 
     suspend fun stop()
 
+    /**
+     * Moves bytes only if [TransportTransferRequest.opportunity] is still the
+     * adapter's current exact revision. A missing or superseded revision returns
+     * [TransportTransferResult.OpportunityUnavailable]; it must never be
+     * resolved against newer peer, address, direction, or freshness facts.
+     */
     suspend fun transfer(request: TransportTransferRequest): TransportTransferResult
 }
 

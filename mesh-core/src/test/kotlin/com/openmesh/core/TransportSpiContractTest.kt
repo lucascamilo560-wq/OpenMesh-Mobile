@@ -29,15 +29,19 @@ class TransportSpiContractTest {
             adapter.start()
             adapter.start()
             adapter.emit(TransportEvent.OpportunityAvailable(opportunity))
+            val changed = opportunity.copy(
+                revision = REVISION_2,
+                validUntilMs = opportunity.validUntilMs + 1,
+            )
             adapter.emit(
                 TransportEvent.OpportunityChanged(
-                    opportunity.copy(validUntilMs = opportunity.validUntilMs + 1),
+                    previous = opportunity.reference,
+                    opportunity = changed,
                 ),
             )
             adapter.emit(
                 TransportEvent.OpportunityUnavailable(
-                    adapterId = ADAPTER_ID,
-                    opportunityId = OPPORTUNITY_ID,
+                    opportunity = changed.reference,
                     occurredAtMs = 200,
                     reason = TransportOpportunityUnavailableReason.LOST,
                 ),
@@ -108,13 +112,66 @@ class TransportSpiContractTest {
     }
 
     @Test
+    fun `transfer is bound to exact opportunity revision and stale facts fail closed`() =
+        runBlocking {
+            val applied = mutableListOf<TransportOpportunityReference>()
+            val adapter = FakeTransportAdapter(ADAPTER_ID) { request ->
+                applied += request.opportunity
+                TransportTransferResult.CompletedLocally(
+                    transferId = request.transferId,
+                    occurredAtMs = 250,
+                )
+            }
+            val revisionOne = opportunity(
+                revision = REVISION_1,
+                peer = knownPeer(seed = 1),
+                address = TransportAddress.copyOf(ADAPTER_ID, "address-a".encodeToByteArray()),
+            )
+            val revisionTwo = opportunity(
+                revision = REVISION_2,
+                observedAtMs = 150,
+                validUntilMs = 1_050,
+                direction = TransportDirection.SEND_ONLY,
+                peer = knownPeer(seed = 2),
+                address = TransportAddress.copyOf(ADAPTER_ID, "address-b".encodeToByteArray()),
+            )
+
+            adapter.emit(TransportEvent.OpportunityAvailable(revisionOne))
+            adapter.emit(
+                TransportEvent.OpportunityChanged(
+                    previous = revisionOne.reference,
+                    opportunity = revisionTwo,
+                ),
+            )
+
+            val stale = adapter.transfer(transferRequest(revisionOne.reference))
+            assertTrue(stale is TransportTransferResult.OpportunityUnavailable)
+            assertEquals(
+                revisionOne.reference,
+                (stale as TransportTransferResult.OpportunityUnavailable).opportunity,
+            )
+            assertTrue(applied.isEmpty())
+
+            val current = adapter.transfer(transferRequest(revisionTwo.reference))
+            assertTrue(current is TransportTransferResult.CompletedLocally)
+            assertEquals(listOf(revisionTwo.reference), applied)
+
+            expectThrows<IllegalArgumentException> {
+                TransportEvent.OpportunityChanged(
+                    previous = revisionOne.reference,
+                    opportunity = revisionTwo.copy(revision = REVISION_1),
+                )
+            }
+        }
+
+    @Test
     fun `inbound bytes and transport addresses are opaque defensive copies`() {
         val addressInput = byteArrayOf(0x01, 0x02, 0x03)
         val payloadInput = byteArrayOf(0x10, 0x20, 0x30, 0x40)
         val address = TransportAddress.copyOf(ADAPTER_ID, addressInput)
         val inbound = TransportEvent.InboundBytes.copyOf(
             adapterId = ADAPTER_ID,
-            opportunityId = OPPORTUNITY_ID,
+            opportunity = opportunity().reference,
             sourceAddress = address,
             occurredAtMs = 300,
             bytes = payloadInput,
@@ -148,8 +205,10 @@ class TransportSpiContractTest {
                 occurredAtMs = 500,
             )
         }
+        val currentOpportunity = opportunity()
+        adapter.emit(TransportEvent.OpportunityAvailable(currentOpportunity))
 
-        val result = adapter.transfer(transferRequest())
+        val result = adapter.transfer(transferRequest(currentOpportunity.reference))
 
         assertTrue(result is TransportTransferResult.CompletedLocally)
         val after = store.snapshot(deliveryId)
@@ -178,12 +237,16 @@ class TransportSpiContractTest {
             TransportTransferResult.CompletedLocally(request.transferId, occurredAtMs = 601)
         }
         val adapters = TransportAdapterSet.copyOf(listOf(failedAdapter, healthyAdapter))
+        val failedOpportunity = opportunity(adapterId = failedAdapter.adapterId)
+        val healthyOpportunity = opportunity(adapterId = healthyAdapter.adapterId)
+        failedAdapter.emit(TransportEvent.OpportunityAvailable(failedOpportunity))
+        healthyAdapter.emit(TransportEvent.OpportunityAvailable(healthyOpportunity))
 
         val failed = failedAdapter.transfer(
-            transferRequest(adapterId = failedAdapter.adapterId),
+            transferRequest(failedOpportunity.reference),
         )
         val completed = healthyAdapter.transfer(
-            transferRequest(adapterId = healthyAdapter.adapterId),
+            transferRequest(healthyOpportunity.reference),
         )
 
         assertTrue(failed is TransportTransferResult.FailedLocally)
@@ -201,13 +264,14 @@ class TransportSpiContractTest {
             TransportOpportunityId("é".repeat(129))
         }
         expectThrows<IllegalArgumentException> { TransportTransferId("") }
+        expectThrows<IllegalArgumentException> { TransportOpportunityRevision(0) }
         expectThrows<IllegalArgumentException> {
             TransportAddress.copyOf(ADAPTER_ID, ByteArray(TransportAddress.MAX_BYTES + 1))
         }
         expectThrows<IllegalArgumentException> {
             TransportTransferRequest.copyOf(
                 transferId = TRANSFER_ID,
-                opportunity = TransportOpportunityKey(ADAPTER_ID, OPPORTUNITY_ID),
+                opportunity = opportunity().reference,
                 bytes = ByteArray(TransportContractLimits.MAX_OPAQUE_BYTES + 1),
             )
         }
@@ -239,6 +303,8 @@ class TransportSpiContractTest {
             TransportAdapter::class.java,
             TransportAdapterSet::class.java,
             TransportOpportunity::class.java,
+            TransportOpportunityReference::class.java,
+            TransportOpportunityRevision::class.java,
             TransportEvent::class.java,
             TransportEvent.InboundBytes::class.java,
             TransportTransferRequest::class.java,
@@ -278,18 +344,21 @@ class TransportSpiContractTest {
     }
 
     private fun opportunity(
+        adapterId: TransportAdapterId = ADAPTER_ID,
         opportunityId: TransportOpportunityId = OPPORTUNITY_ID,
+        revision: TransportOpportunityRevision = REVISION_1,
         observedAtMs: Long = 100,
         validUntilMs: Long = 1_000,
         direction: TransportDirection = TransportDirection.BIDIRECTIONAL,
         peer: TransportPeer = TransportPeer.Unknown,
         address: TransportAddress? = TransportAddress.copyOf(
-            ADAPTER_ID,
+            adapterId,
             "adapter-local-address".encodeToByteArray(),
         ),
     ): TransportOpportunity = TransportOpportunity(
-        adapterId = ADAPTER_ID,
+        adapterId = adapterId,
         opportunityId = opportunityId,
+        revision = revision,
         observedAtMs = observedAtMs,
         validUntilMs = validUntilMs,
         direction = direction,
@@ -297,15 +366,20 @@ class TransportSpiContractTest {
         address = address,
     )
 
-    private fun knownPeer(): TransportPeer.KnownNode = TransportPeer.KnownNode(
-        NodeId(MeshNodeId.fromDigest(ByteArray(MeshNodeId.DIGEST_BYTES) { it.toByte() })),
-    )
+    private fun knownPeer(seed: Int = 0): TransportPeer.KnownNode =
+        TransportPeer.KnownNode(
+            NodeId(
+                MeshNodeId.fromDigest(
+                    ByteArray(MeshNodeId.DIGEST_BYTES) { (it + seed).toByte() },
+                ),
+            ),
+        )
 
     private fun transferRequest(
-        adapterId: TransportAdapterId = ADAPTER_ID,
+        opportunity: TransportOpportunityReference = opportunity().reference,
     ): TransportTransferRequest = TransportTransferRequest.copyOf(
         transferId = TRANSFER_ID,
-        opportunity = TransportOpportunityKey(adapterId, OPPORTUNITY_ID),
+        opportunity = opportunity,
         bytes = byteArrayOf(0x01, 0x02, 0x03),
     )
 
@@ -356,6 +430,8 @@ class TransportSpiContractTest {
             },
     ) : TransportAdapter {
         private val mutableEvents = MutableSharedFlow<TransportEvent>(extraBufferCapacity = 8)
+        private val currentOpportunities =
+            linkedMapOf<TransportOpportunityKey, TransportOpportunityReference>()
         override val events: Flow<TransportEvent> = mutableEvents.asSharedFlow()
 
         var startTransitions: Int = 0
@@ -384,11 +460,36 @@ class TransportSpiContractTest {
             require(request.opportunity.adapterId == adapterId) {
                 "Transfer opportunity belongs to another adapter"
             }
+            if (currentOpportunities[request.opportunity.key] != request.opportunity) {
+                return TransportTransferResult.OpportunityUnavailable(
+                    transferId = request.transferId,
+                    occurredAtMs = 399,
+                    opportunity = request.opportunity,
+                )
+            }
             return transferBehavior(request)
         }
 
         suspend fun emit(event: TransportEvent) {
             require(event.adapterId == adapterId) { "Event belongs to another adapter" }
+            when (event) {
+                is TransportEvent.OpportunityAvailable -> {
+                    currentOpportunities[event.opportunity.key] = event.opportunity.reference
+                }
+
+                is TransportEvent.OpportunityChanged -> {
+                    require(currentOpportunities[event.previous.key] == event.previous) {
+                        "Opportunity change does not follow the current revision"
+                    }
+                    currentOpportunities[event.opportunity.key] = event.opportunity.reference
+                }
+
+                is TransportEvent.OpportunityUnavailable -> {
+                    currentOpportunities.remove(event.opportunity.key, event.opportunity)
+                }
+
+                is TransportEvent.InboundBytes -> Unit
+            }
             mutableEvents.emit(event)
         }
     }
@@ -396,6 +497,8 @@ class TransportSpiContractTest {
     private companion object {
         val ADAPTER_ID = TransportAdapterId("test-radio")
         val OPPORTUNITY_ID = TransportOpportunityId("temporary-contact-1")
+        val REVISION_1 = TransportOpportunityRevision(1)
+        val REVISION_2 = TransportOpportunityRevision(2)
         val TRANSFER_ID = TransportTransferId("transport-request-1")
     }
 }
