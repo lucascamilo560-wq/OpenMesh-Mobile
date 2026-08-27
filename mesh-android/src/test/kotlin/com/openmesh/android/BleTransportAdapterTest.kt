@@ -21,6 +21,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -105,6 +106,7 @@ class BleTransportAdapterTest {
 
             adapter.start()
             observe(adapter, ADDRESS_A, seenAtMs = 100)
+            awaitEvents(events, 1)
 
             val availableX = events.single() as TransportEvent.OpportunityAvailable
             assertEquals(TransportDirection.SEND_ONLY, availableX.opportunity.direction)
@@ -117,6 +119,7 @@ class BleTransportAdapterTest {
             )
 
             observe(adapter, ADDRESS_A, seenAtMs = 120)
+            awaitEvents(events, 2)
             val refreshed = events[1] as TransportEvent.OpportunityChanged
             assertEquals(availableX.opportunity.reference, refreshed.previous)
             assertEquals(TransportOpportunityRevision(2), refreshed.opportunity.revision)
@@ -125,12 +128,14 @@ class BleTransportAdapterTest {
             clock.now = 220
             adapter.expireStaleOpportunities()
             adapter.expireStaleOpportunities()
+            awaitEvents(events, 3)
             val expiryEvents = events.filterIsInstance<TransportEvent.OpportunityUnavailable>()
             assertEquals(1, expiryEvents.size)
             assertEquals(TransportOpportunityUnavailableReason.EXPIRED, expiryEvents.single().reason)
             assertEquals(refreshed.opportunity.reference, expiryEvents.single().opportunity)
 
             observe(adapter, ADDRESS_A, seenAtMs = 230)
+            awaitEvents(events, 4)
             val availableY = events.filterIsInstance<TransportEvent.OpportunityAvailable>().last()
             assertNotEquals(
                 availableX.opportunity.opportunityId,
@@ -140,12 +145,14 @@ class BleTransportAdapterTest {
 
             clock.now = 240
             adapter.stop()
+            awaitEvents(events, 5)
             val stopped = events.filterIsInstance<TransportEvent.OpportunityUnavailable>().last()
             assertEquals(TransportOpportunityUnavailableReason.ADAPTER_STOPPED, stopped.reason)
             assertEquals(availableY.opportunity.reference, stopped.opportunity)
 
             adapter.start()
             observe(adapter, ADDRESS_A, seenAtMs = 250)
+            awaitEvents(events, 6)
             val availableZ = events.filterIsInstance<TransportEvent.OpportunityAvailable>().last()
             assertNotEquals(
                 availableY.opportunity.opportunityId,
@@ -181,11 +188,13 @@ class BleTransportAdapterTest {
 
             adapter.start()
             observe(adapter, ADDRESS_A, 100)
+            awaitEvents(events, 1)
             val x = (events.single() as TransportEvent.OpportunityAvailable).opportunity
 
             clock.now = 200
             adapter.expireStaleOpportunities()
             observe(adapter, ADDRESS_A, 210)
+            awaitEvents(events, 3)
             val y = events.filterIsInstance<TransportEvent.OpportunityAvailable>().last().opportunity
             assertNotEquals(x.opportunityId, y.opportunityId)
 
@@ -196,7 +205,7 @@ class BleTransportAdapterTest {
             clock.now = 220
             val expectedIdentity = resolvedIdentity(seed = 2)
             newIdentity.complete(expectedIdentity)
-            yield()
+            awaitEvent(events) { it is TransportEvent.OpportunityChanged }
 
             val identified = events.filterIsInstance<TransportEvent.OpportunityChanged>().single()
             assertEquals(y.reference, identified.previous)
@@ -225,6 +234,7 @@ class BleTransportAdapterTest {
             }
             adapter.start()
             observe(adapter, ADDRESS_A, 100)
+            awaitEvents(events, 1)
             val revisionOne =
                 (events.single() as TransportEvent.OpportunityAvailable).opportunity.reference
             val arbitraryBytes = byteArrayOf(0x00, 0x7f, 0x55, 0x01, 0x02)
@@ -236,6 +246,7 @@ class BleTransportAdapterTest {
             assertArrayEquals(arbitraryBytes, platform.sent.single().second)
 
             observe(adapter, ADDRESS_A, 120)
+            awaitEvents(events, 2)
             val revisionTwo =
                 events.filterIsInstance<TransportEvent.OpportunityChanged>().last().opportunity.reference
             val stale = adapter.transfer(request(revisionOne, arbitraryBytes, "stale"))
@@ -261,6 +272,7 @@ class BleTransportAdapterTest {
             clock.now = 220
             adapter.expireStaleOpportunities()
             observe(adapter, ADDRESS_A, 230)
+            awaitEvents(events, 5)
             releaseSend.complete(Unit)
             assertTrue(inFlight.await() is TransportTransferResult.CompletedLocally)
             assertEquals(listOf(ADDRESS_A, ADDRESS_A), platform.sent.map { it.first })
@@ -308,6 +320,7 @@ class BleTransportAdapterTest {
             adapter.start()
             val invalidEnvelopeBytes = byteArrayOf(0x01, 0x02, 0x03, 0x04)
             platform.emitInbound(ADDRESS_UNKNOWN, invalidEnvelopeBytes)
+            awaitEvents(events, 1)
 
             val unknownInbound = events.single() as TransportEvent.InboundBytes
             assertNull(unknownInbound.opportunity)
@@ -319,12 +332,13 @@ class BleTransportAdapterTest {
             assertArrayEquals(invalidEnvelopeBytes, unknownInbound.bytes.copyToByteArray())
 
             observe(adapter, ADDRESS_A, 110)
-            yield()
+            awaitEvent(events) { it is TransportEvent.OpportunityChanged }
             val knownOpportunity = events.filterIsInstance<TransportEvent.OpportunityChanged>()
                 .last().opportunity
             val inboundBytes = byteArrayOf(0x7f, 0x00, 0x55)
             clock.now = 120
             platform.emitInbound(ADDRESS_A, inboundBytes)
+            awaitEventCount<TransportEvent.InboundBytes>(events, 2)
 
             val knownInbound = events.filterIsInstance<TransportEvent.InboundBytes>().last()
             assertEquals(knownOpportunity.reference, knownInbound.opportunity)
@@ -381,6 +395,30 @@ class BleTransportAdapterTest {
                 seenAtMs = seenAtMs,
             ),
         )
+    }
+
+    private suspend fun awaitEvents(events: List<TransportEvent>, expectedSize: Int) {
+        withTimeout(1_000) {
+            while (events.size < expectedSize) yield()
+        }
+    }
+
+    private suspend fun awaitEvent(
+        events: List<TransportEvent>,
+        predicate: (TransportEvent) -> Boolean,
+    ) {
+        withTimeout(1_000) {
+            while (events.none(predicate)) yield()
+        }
+    }
+
+    private suspend inline fun <reified T : TransportEvent> awaitEventCount(
+        events: List<TransportEvent>,
+        expectedCount: Int,
+    ) {
+        withTimeout(1_000) {
+            while (events.count { it is T } < expectedCount) yield()
+        }
     }
 
     private fun resolvedIdentity(seed: Int): ResolvedPeerIdentity = ResolvedPeerIdentity(
