@@ -119,6 +119,10 @@ class LegacyPacketStoreMigrationTest {
         assertNull(expiredSnapshot.deliveryObject)
         assertEquals(DeliveryState.EXPIRED, expiredSnapshot.deliveryRecord?.state)
         assertNotNull(expiredSnapshot.tombstone)
+        assertEquals(
+            300 + LegacyV1DeliveryPacketStore.DEFAULT_REPLAY_GUARD_MS,
+            expiredSnapshot.tombstone?.expiresAtMs,
+        )
         assertNoInventedFacts(expiredSnapshot)
 
         assertFalse(

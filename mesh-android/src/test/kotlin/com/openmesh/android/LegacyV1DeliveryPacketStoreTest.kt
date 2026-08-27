@@ -6,6 +6,7 @@ import com.openmesh.core.DeliveryId
 import com.openmesh.core.DeliveryIngest
 import com.openmesh.core.DeliveryObject
 import com.openmesh.core.DeliveryState
+import com.openmesh.core.DeliveryStoreLimits
 import com.openmesh.core.EndpointId
 import com.openmesh.core.IngestResult
 import com.openmesh.core.IngressProvenance
@@ -115,7 +116,7 @@ class LegacyV1DeliveryPacketStoreTest {
                     nowMs = nowMs,
                 ) is TransferReservationResult.NotEligible
             )
-            assertEquals(3, store.listOutbox().size)
+            assertTrue(store.listOutbox().isEmpty())
             store.close()
         }
 
@@ -128,7 +129,7 @@ class LegacyV1DeliveryPacketStoreTest {
 
             bridge.put(packet)
             bridge.put(packet)
-            assertEquals(1, store.listOutbox().size)
+            assertTrue(store.listOutbox().isEmpty())
 
             expectSuspendThrows(CanonicalDeliveryConflictException::class.java) {
                 bridge.put(packet.copy(payloadBase64 = "Y29uZmxpY3Q="))
@@ -251,12 +252,159 @@ class LegacyV1DeliveryPacketStoreTest {
         store.close()
     }
 
+    @Test
+    fun `tombstones follow envelope expiry plus replay guard and pruning keeps purge count honest`() =
+        runBlocking {
+            var store = AndroidDeliveryStore(context, databaseName)
+            var bridge = bridge(store)
+            val expiresNow = envelope(
+                id = "v1-finite-expiry",
+                source = REMOTE_NODE_ID,
+                destination = OTHER_NODE_ID,
+                expiresAtMs = 200,
+            )
+            val removedBeforeExpiry = envelope(
+                id = "v1-future-expiry",
+                source = REMOTE_NODE_ID,
+                destination = OTHER_NODE_ID,
+                expiresAtMs = 5_000,
+            )
+            bridge.put(expiresNow)
+            bridge.put(removedBeforeExpiry)
+            bridge.remove(removedBeforeExpiry.packetId)
+
+            assertEquals(
+                6_000L,
+                store.snapshot(DeliveryId(removedBeforeExpiry.packetId)).tombstone?.expiresAtMs,
+            )
+            nowMs = 200
+            assertEquals(1, bridge.purgeExpired(nowMs))
+            assertEquals(
+                1_200L,
+                store.snapshot(DeliveryId(expiresNow.packetId)).tombstone?.expiresAtMs,
+            )
+            store.close()
+
+            nowMs = 1_200
+            store = AndroidDeliveryStore(context, databaseName)
+            bridge = bridge(store)
+            assertEquals(0, bridge.purgeExpired(nowMs))
+            assertNull(store.snapshot(DeliveryId(expiresNow.packetId)).deliveryRecord)
+            assertNotNull(
+                store.snapshot(DeliveryId(removedBeforeExpiry.packetId)).tombstone
+            )
+            store.close()
+        }
+
+    @Test
+    fun `admission opportunistically prunes expired tombstones`() = runBlocking {
+        nowMs = 100
+        val store = AndroidDeliveryStore(context, databaseName)
+        val bridge = bridge(store)
+        val alreadyExpired = envelope(
+            id = "v1-prune-before-admission",
+            source = REMOTE_NODE_ID,
+            destination = OTHER_NODE_ID,
+            expiresAtMs = 99,
+        )
+        bridge.put(alreadyExpired)
+        assertNotNull(store.snapshot(DeliveryId(alreadyExpired.packetId)).tombstone)
+
+        nowMs = 1_100
+        bridge.put(envelope("v1-after-prune", LOCAL_NODE_ID, REMOTE_NODE_ID))
+
+        assertNull(store.snapshot(DeliveryId(alreadyExpired.packetId)).deliveryRecord)
+        assertTrue(bridge.contains("v1-after-prune"))
+        store.close()
+    }
+
+    @Test
+    fun `v1 settlement drains more lifecycles than bounded outbox capacity`() = runBlocking {
+        val store = AndroidDeliveryStore(
+            context = context,
+            databaseName = databaseName,
+            limits = DeliveryStoreLimits(
+                maxOutboxRecords = 1,
+                maxOutboxReadBatch = 1,
+            ),
+        )
+        val bridge = bridge(store)
+
+        repeat(8) { index ->
+            val cycleStartedAt = nowMs
+            val packet = envelope(
+                id = "v1-bounded-outbox-$index",
+                source = REMOTE_NODE_ID,
+                destination = OTHER_NODE_ID,
+                expiresAtMs = cycleStartedAt + 10,
+            )
+            bridge.put(packet)
+            assertTrue(store.listOutbox(limit = 1).isEmpty())
+
+            if (index % 2 == 0) {
+                nowMs = cycleStartedAt + 10
+                assertEquals(1, bridge.purgeExpired(nowMs))
+            } else {
+                bridge.remove(packet.packetId)
+            }
+            assertTrue(store.listOutbox(limit = 1).isEmpty())
+
+            nowMs = cycleStartedAt + 1_010
+            assertEquals(0, bridge.purgeExpired(nowMs))
+            assertNull(store.snapshot(DeliveryId(packet.packetId)).deliveryRecord)
+        }
+
+        store.close()
+    }
+
+    @Test
+    fun `v1 settlement leaves generic outbox events untouched even when acknowledged`() =
+        runBlocking {
+            val store = AndroidDeliveryStore(context, databaseName)
+            val bridge = bridge(store)
+            val generic = DeliveryObject.copyOf(
+                deliveryId = DeliveryId("future-generic-outbox"),
+                destination = EndpointId("dtn://future.example/outbox"),
+                source = null,
+                createdAtMs = 10,
+                expiresAtMs = 10_000,
+                canonicalBytes = byteArrayOf(7, 8, 9),
+            )
+            store.ingest(
+                DeliveryIngest(
+                    deliveryObject = generic,
+                    destinationIsLocal = false,
+                    provenance = IngressProvenance(
+                        IngressProvenance.Kind.REMOTE_PROTOCOL,
+                        "future-profile",
+                    ),
+                ),
+                nowMs = nowMs,
+            )
+            val genericEvent = store.listOutbox(limit = 10).single()
+
+            bridge.put(envelope("v1-selective-outbox", REMOTE_NODE_ID, OTHER_NODE_ID))
+            assertEquals(listOf(genericEvent), store.listOutbox(limit = 10))
+
+            val acknowledgedGeneric = store.acknowledgeOutbox(
+                eventId = genericEvent.eventId,
+                nowMs = nowMs + 1,
+            )
+            bridge.settleRecognizedV1Outbox(nowMs + 2)
+
+            assertEquals(
+                listOf(acknowledgedGeneric),
+                store.listOutbox(limit = 10),
+            )
+            store.close()
+        }
+
     private fun bridge(store: AndroidDeliveryStore): LegacyV1DeliveryPacketStore =
         LegacyV1DeliveryPacketStore(
             store = store,
             localNodeId = LOCAL_NODE_ID,
             clock = { nowMs },
-            tombstoneRetentionMs = 1_000,
+            tombstoneReplayGuardMs = 1_000,
         )
 
     private fun envelope(

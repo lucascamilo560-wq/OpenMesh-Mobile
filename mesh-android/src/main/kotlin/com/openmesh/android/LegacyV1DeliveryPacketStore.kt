@@ -1,5 +1,6 @@
 package com.openmesh.android
 
+import android.content.ContentValues
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import com.openmesh.core.CanonicalDeliveryConflictException
@@ -26,11 +27,13 @@ class LegacyV1DeliveryPacketStore internal constructor(
     private val store: AndroidDeliveryStore,
     val localNodeId: NodeId,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val tombstoneRetentionMs: Long = DEFAULT_TOMBSTONE_RETENTION_MS,
+    private val tombstoneReplayGuardMs: Long = DEFAULT_REPLAY_GUARD_MS,
+    private val outboxSettlementHooks: LegacyV1OutboxSettlementHooks =
+        LegacyV1OutboxSettlementHooks(),
 ) : PacketStore {
 
     init {
-        require(tombstoneRetentionMs > 0) { "Tombstone retention must be positive" }
+        requireLegacyV1ReplayGuard(tombstoneReplayGuardMs)
     }
 
     override suspend fun contains(packetId: String): Boolean {
@@ -48,6 +51,8 @@ class LegacyV1DeliveryPacketStore internal constructor(
         val deliveryObject = legacyV1DeliveryObject(packet, canonicalBytes)
         val provenance = runtimeV1Provenance(packet, localNodeId)
         val nowMs = clock()
+        settleRecognizedV1Outbox(nowMs)
+        pruneExpiredTombstones(nowMs)
 
         store.writeForLegacyV1Runtime { transaction ->
             val database = transaction.database
@@ -64,7 +69,11 @@ class LegacyV1DeliveryPacketStore internal constructor(
                     deliveryObject = deliveryObject,
                     provenance = provenance,
                     nowMs = nowMs,
-                    tombstoneExpiresAtMs = retainedUntil(nowMs),
+                    tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                        packetExpiresAtMs = packet.expiresAtMs,
+                        nowMs = nowMs,
+                        replayGuardMs = tombstoneReplayGuardMs,
+                    ),
                 )
                 return@writeForLegacyV1Runtime
             }
@@ -99,11 +108,15 @@ class LegacyV1DeliveryPacketStore internal constructor(
                 }
             }
         }
+        outboxSettlementHooks.afterMutationCommittedBeforeSettlement()
+        settleRecognizedV1Outbox(nowMs)
     }
 
     override suspend fun remove(packetId: String) {
         val deliveryId = runCatching { DeliveryId(packetId) }.getOrNull() ?: return
         val nowMs = clock()
+        settleRecognizedV1Outbox(nowMs)
+        pruneExpiredTombstones(nowMs)
         store.writeForLegacyV1Runtime { transaction ->
             val row = loadRecognizedV1Object(transaction.database, deliveryId) ?: return@writeForLegacyV1Runtime
             val envelope = row.decodeAndValidate(localNodeId, permitLocal = true)
@@ -113,10 +126,16 @@ class LegacyV1DeliveryPacketStore internal constructor(
                 provenance = runtimeV1Provenance(envelope, localNodeId),
                 nowMs = nowMs,
                 tombstoneReason = TombstoneReason.EXPLICITLY_REMOVED,
-                tombstoneExpiresAtMs = retainedUntil(nowMs),
+                tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                    packetExpiresAtMs = envelope.expiresAtMs,
+                    nowMs = nowMs,
+                    replayGuardMs = tombstoneReplayGuardMs,
+                ),
                 emitExpiredEvent = false,
             )
         }
+        outboxSettlementHooks.afterMutationCommittedBeforeSettlement()
+        settleRecognizedV1Outbox(nowMs)
     }
 
     /**
@@ -129,8 +148,10 @@ class LegacyV1DeliveryPacketStore internal constructor(
             .map { row -> row.decodeAndValidate(localNodeId, permitLocal = false) }
     }
 
-    override suspend fun purgeExpired(nowMs: Long): Int =
-        store.writeForLegacyV1Runtime { transaction ->
+    override suspend fun purgeExpired(nowMs: Long): Int {
+        settleRecognizedV1Outbox(nowMs)
+        pruneExpiredTombstones(nowMs)
+        val expiredCount = store.writeForLegacyV1Runtime { transaction ->
             val expired = loadExpiredRecognizedV1Objects(transaction.database, nowMs)
             expired.forEach { row ->
                 val envelope = row.decodeAndValidate(localNodeId, permitLocal = true)
@@ -139,25 +160,92 @@ class LegacyV1DeliveryPacketStore internal constructor(
                     deliveryObject = legacyV1DeliveryObject(envelope, row.canonicalBytes),
                     provenance = runtimeV1Provenance(envelope, localNodeId),
                     nowMs = nowMs,
-                    tombstoneExpiresAtMs = retainedUntil(nowMs),
+                    tombstoneExpiresAtMs = legacyV1TombstoneExpiresAt(
+                        packetExpiresAtMs = envelope.expiresAtMs,
+                        nowMs = nowMs,
+                        replayGuardMs = tombstoneReplayGuardMs,
+                    ),
                 )
             }
             expired.size
         }
+        outboxSettlementHooks.afterMutationCommittedBeforeSettlement()
+        settleRecognizedV1Outbox(nowMs)
+        pruneExpiredTombstones(nowMs)
+        return expiredCount
+    }
 
-    private fun retainedUntil(nowMs: Long): Long =
-        if (Long.MAX_VALUE - nowMs < tombstoneRetentionMs) Long.MAX_VALUE
-        else nowMs + tombstoneRetentionMs
+    /**
+     * Settles only compatibility-runtime events while their persisted v1
+     * provenance is still available. Acknowledgement and pruning are separate
+     * commits, so a crash between them is recovered by the next invocation.
+     */
+    internal suspend fun settleRecognizedV1Outbox(nowMs: Long): Int {
+        val batchSize = store.configuredLimits.maxOutboxReadBatch
+        var totalPruned = 0
+        do {
+            val acknowledged = store.acknowledgeRecognizedLegacyV1Outbox(
+                nowMs = nowMs,
+                limit = batchSize,
+            )
+            if (acknowledged > 0) {
+                outboxSettlementHooks.afterAcknowledgementCommittedBeforePrune()
+            }
+            val pruned = store.pruneAcknowledgedRecognizedLegacyV1Outbox(
+                beforeOrAtMs = nowMs,
+                limit = batchSize,
+            )
+            totalPruned += pruned
+        } while (acknowledged == batchSize || pruned == batchSize)
+        return totalPruned
+    }
+
+    internal suspend fun pruneExpiredTombstones(nowMs: Long): Int {
+        val batchSize = store.configuredLimits.maxOutboxReadBatch
+        var total = 0
+        do {
+            val pruned = store.pruneExpiredTombstones(nowMs, batchSize)
+            total += pruned
+        } while (pruned == batchSize)
+        return total
+    }
 
     companion object {
-        /** Conservative until the production cutover supplies an explicit retention policy. */
-        const val DEFAULT_TOMBSTONE_RETENTION_MS = Long.MAX_VALUE
+        const val DEFAULT_REPLAY_GUARD_MS = BleMeshNode.DEFAULT_TTL_MS
+        const val MAX_REPLAY_GUARD_MS = 30L * 24L * 60L * 60L * 1000L
         internal const val RUNTIME_V1_PROVENANCE = "legacy-v1-runtime:mesh-envelope-v1"
     }
 }
 
+internal fun requireLegacyV1ReplayGuard(replayGuardMs: Long) {
+    require(replayGuardMs in 1..LegacyV1DeliveryPacketStore.MAX_REPLAY_GUARD_MS) {
+        "Legacy v1 replay guard must be between 1 and " +
+            "${LegacyV1DeliveryPacketStore.MAX_REPLAY_GUARD_MS} ms"
+    }
+}
+
+internal fun legacyV1TombstoneExpiresAt(
+    packetExpiresAtMs: Long,
+    nowMs: Long,
+    replayGuardMs: Long,
+): Long {
+    requireLegacyV1ReplayGuard(replayGuardMs)
+    val retentionAnchor = maxOf(packetExpiresAtMs, nowMs)
+    if (retentionAnchor > Long.MAX_VALUE - replayGuardMs) {
+        throw LegacyV1PacketStoreException(
+            "Legacy v1 tombstone expiry exceeds the supported timestamp range"
+        )
+    }
+    return retentionAnchor + replayGuardMs
+}
+
 class LegacyV1PacketStoreException(message: String, cause: Throwable? = null) :
     IllegalStateException(message, cause)
+
+internal data class LegacyV1OutboxSettlementHooks(
+    val afterMutationCommittedBeforeSettlement: () -> Unit = {},
+    val afterAcknowledgementCommittedBeforePrune: () -> Unit = {},
+)
 
 private data class LegacyV1ObjectRow(
     val deliveryId: DeliveryId,
@@ -235,6 +323,96 @@ private fun hasRecognizedV1Record(
     """.trimIndent(),
     arrayOf(deliveryId.value, LegacyV1DeliveryPacketStore.RUNTIME_V1_PROVENANCE),
 ).use(Cursor::moveToFirst)
+
+private suspend fun AndroidDeliveryStore.acknowledgeRecognizedLegacyV1Outbox(
+    nowMs: Long,
+    limit: Int,
+): Int = writeForLegacyV1Runtime { transaction ->
+    require(limit in 1..configuredLimits.maxOutboxReadBatch)
+    val eventIds = loadRecognizedLegacyV1OutboxEventIds(
+        database = transaction.database,
+        acknowledged = false,
+        beforeOrAtMs = null,
+        limit = limit,
+    )
+    if (eventIds.isEmpty()) return@writeForLegacyV1Runtime 0
+    val values = ContentValues().apply { put("acknowledged_at_ms", nowMs) }
+    eventIds.forEach { eventId ->
+        check(
+            transaction.database.update(
+                DeliverySchema.OUTBOX,
+                values,
+                "event_id = ? AND acknowledged_at_ms IS NULL",
+                arrayOf(eventId),
+            ) == 1
+        )
+    }
+    transaction.markChanged()
+    eventIds.size
+}
+
+private suspend fun AndroidDeliveryStore.pruneAcknowledgedRecognizedLegacyV1Outbox(
+    beforeOrAtMs: Long,
+    limit: Int,
+): Int = writeForLegacyV1Runtime { transaction ->
+    require(limit in 1..configuredLimits.maxOutboxReadBatch)
+    val eventIds = loadRecognizedLegacyV1OutboxEventIds(
+        database = transaction.database,
+        acknowledged = true,
+        beforeOrAtMs = beforeOrAtMs,
+        limit = limit,
+    )
+    eventIds.forEach { eventId ->
+        check(
+            transaction.database.delete(
+                DeliverySchema.OUTBOX,
+                "event_id = ?",
+                arrayOf(eventId),
+            ) == 1
+        )
+    }
+    if (eventIds.isNotEmpty()) transaction.markChanged()
+    eventIds.size
+}
+
+private fun loadRecognizedLegacyV1OutboxEventIds(
+    database: SQLiteDatabase,
+    acknowledged: Boolean,
+    beforeOrAtMs: Long?,
+    limit: Int,
+): List<String> {
+    check(acknowledged == (beforeOrAtMs != null))
+    val acknowledgementClause = if (acknowledged) {
+        "outbox.acknowledged_at_ms IS NOT NULL AND outbox.acknowledged_at_ms <= ?"
+    } else {
+        "outbox.acknowledged_at_ms IS NULL"
+    }
+    val arguments = buildList {
+        if (beforeOrAtMs != null) add(beforeOrAtMs.toString())
+        add(LEGACY_V1_OUTBOX_DURABLY_STORED)
+        add(LEGACY_V1_OUTBOX_DELIVERY_EXPIRED)
+        add(LegacyV1DeliveryPacketStore.RUNTIME_V1_PROVENANCE)
+        add(limit.toString())
+    }.toTypedArray()
+    return database.rawQuery(
+        """
+        SELECT outbox.event_id
+        FROM ${DeliverySchema.OUTBOX} outbox
+        JOIN ${DeliverySchema.DELIVERY_RECORDS} records
+          ON records.delivery_id = outbox.delivery_id
+        WHERE $acknowledgementClause
+          AND outbox.event_type IN (?, ?)
+          AND ${recognizedV1RecordPredicate("records.delivery_id")}
+        ORDER BY outbox.sequence
+        LIMIT ?
+        """.trimIndent(),
+        arguments,
+    ).use { cursor ->
+        buildList {
+            while (cursor.moveToNext()) add(cursor.getString(0))
+        }
+    }
+}
 
 private fun loadRecognizedV1Object(
     database: SQLiteDatabase,
@@ -354,3 +532,6 @@ private fun Cursor.toLegacyV1ObjectRow(): LegacyV1ObjectRow = LegacyV1ObjectRow(
     expiresAtMs = getLong(getColumnIndexOrThrow("expires_at_ms")),
     canonicalBytes = getBlob(getColumnIndexOrThrow("canonical_bytes")),
 )
+
+private const val LEGACY_V1_OUTBOX_DURABLY_STORED = "DURABLY_STORED"
+private const val LEGACY_V1_OUTBOX_DELIVERY_EXPIRED = "DELIVERY_EXPIRED"
