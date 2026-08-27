@@ -386,7 +386,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
             val first = coordinator()
             val initiallyPrepared = first.prepare(nowMs = 100)
             assertEquals(
-                1_100,
+                1_100L,
                 initiallyPrepared.deliveryStore.snapshot(DeliveryId(packetId))
                     .tombstone?.expiresAtMs,
             )
@@ -394,7 +394,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
                 transaction.database.execSQL(
                     "UPDATE ${DeliverySchema.TOMBSTONES} SET expires_at_ms = ? " +
                         "WHERE delivery_id = ?",
-                    arrayOf(Long.MAX_VALUE, packetId),
+                    arrayOf<Any>(Long.MAX_VALUE, packetId),
                 )
                 transaction.markChanged()
             }
@@ -403,7 +403,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
             val normalized = coordinator()
             val normalizedPreparation = normalized.prepare(nowMs = 500)
             assertEquals(
-                1_500,
+                1_500L,
                 normalizedPreparation.deliveryStore.snapshot(DeliveryId(packetId))
                     .tombstone?.expiresAtMs,
             )
@@ -412,7 +412,7 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
             val restarted = coordinator()
             val recovered = restarted.prepare(nowMs = 700)
             assertEquals(
-                1_500,
+                1_500L,
                 recovered.deliveryStore.snapshot(DeliveryId(packetId)).tombstone?.expiresAtMs,
             )
             restarted.close()

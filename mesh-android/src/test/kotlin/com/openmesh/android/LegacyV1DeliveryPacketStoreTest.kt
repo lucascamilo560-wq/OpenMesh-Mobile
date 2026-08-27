@@ -273,13 +273,13 @@ class LegacyV1DeliveryPacketStoreTest {
             bridge.remove(removedBeforeExpiry.packetId)
 
             assertEquals(
-                6_000,
+                6_000L,
                 store.snapshot(DeliveryId(removedBeforeExpiry.packetId)).tombstone?.expiresAtMs,
             )
             nowMs = 200
             assertEquals(1, bridge.purgeExpired(nowMs))
             assertEquals(
-                1_200,
+                1_200L,
                 store.snapshot(DeliveryId(expiresNow.packetId)).tombstone?.expiresAtMs,
             )
             store.close()
