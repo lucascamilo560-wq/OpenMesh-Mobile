@@ -1,6 +1,5 @@
 package com.openmesh.android
 
-import android.app.Application
 import android.content.Context
 import com.openmesh.core.DeliveryId
 import com.openmesh.core.DeliveryState
@@ -34,7 +33,7 @@ class LegacyPacketStoreMigrationTest {
 
     @Before
     fun setUp() {
-        context = RuntimeEnvironment.getApplication<Application>()
+        context = RuntimeEnvironment.getApplication()
         databaseName = "migration-${UUID.randomUUID()}.db"
         preferencesName = "legacy-${UUID.randomUUID()}"
     }

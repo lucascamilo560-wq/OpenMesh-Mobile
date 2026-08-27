@@ -1,6 +1,5 @@
 package com.openmesh.android
 
-import android.app.Application
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import com.openmesh.core.AcceptanceEvidenceId
@@ -66,7 +65,7 @@ class AndroidDeliveryStoreTest {
 
     @Before
     fun setUp() {
-        context = RuntimeEnvironment.getApplication<Application>()
+        context = RuntimeEnvironment.getApplication()
     }
 
     @After
