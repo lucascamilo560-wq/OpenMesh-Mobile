@@ -31,9 +31,14 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 
 class BleTransportAdapterTest {
+
+    @get:Rule
+    val testTimeout: Timeout = Timeout.seconds(10)
 
     @Test
     fun `startup and stop are idempotent and partial startup rolls back in reverse order`() =
