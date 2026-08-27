@@ -94,9 +94,7 @@ class LegacyPacketStoreMigrator internal constructor(
         }
     }
 
-    suspend fun status(): LegacyMigrationStatus? = store.readForLegacyMigration { database ->
-        loadMigrationStatus(database, migrationId)
-    }
+    suspend fun status(): LegacyMigrationStatus? = store.legacyMigrationStatus(migrationId)
 
     suspend fun migrate(nowMs: Long = System.currentTimeMillis()): LegacyMigrationReport {
         val snapshot = source.snapshot()
@@ -370,6 +368,12 @@ internal data class LegacyPacketSnapshot(
     val manifestHash: String,
 )
 
+internal suspend fun AndroidDeliveryStore.legacyMigrationStatus(
+    migrationId: String,
+): LegacyMigrationStatus? = readForLegacyMigration { database ->
+    loadMigrationStatus(database, migrationId)
+}
+
 internal class SharedPreferencesLegacyPacketSource(
     context: Context,
     preferencesName: String,
@@ -489,11 +493,11 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     )
     val expired = entry.envelope.expiresAtMs <= nowMs
     if (expired) {
-        importExpiredLegacyDelivery(transaction, deliveryObject, provenance, nowMs)
+        storeExpiredLegacyV1Delivery(transaction, deliveryObject, provenance, nowMs)
     } else {
         when (disposition) {
             LegacyDeliveryDisposition.LOCAL_QUARANTINED ->
-                importQuarantinedLegacyDelivery(
+                storeQuarantinedLegacyV1Delivery(
                     transaction = transaction,
                     deliveryObject = deliveryObject,
                     provenance = provenance,
@@ -547,7 +551,7 @@ private suspend fun AndroidDeliveryStore.importLegacyEntry(
     true
 }
 
-private fun AndroidDeliveryStore.importQuarantinedLegacyDelivery(
+internal fun AndroidDeliveryStore.storeQuarantinedLegacyV1Delivery(
     transaction: AndroidDeliveryStore.Transaction,
     deliveryObject: DeliveryObject,
     provenance: IngressProvenance,
@@ -652,12 +656,18 @@ private fun AndroidDeliveryStore.importQuarantinedLegacyDelivery(
     }
 }
 
-private fun AndroidDeliveryStore.importExpiredLegacyDelivery(
+internal fun AndroidDeliveryStore.storeExpiredLegacyV1Delivery(
     transaction: AndroidDeliveryStore.Transaction,
     deliveryObject: DeliveryObject,
     provenance: IngressProvenance,
     nowMs: Long,
+    tombstoneReason: TombstoneReason = TombstoneReason.EXPIRED,
+    tombstoneExpiresAtMs: Long = Long.MAX_VALUE,
+    emitExpiredEvent: Boolean = true,
 ) {
+    require(tombstoneExpiresAtMs > nowMs) {
+        "Legacy v1 tombstone expiry must be later than creation"
+    }
     val database = transaction.database
     if (deliveryObject.canonicalBytes.size > configuredLimits.maxObjectBytes) {
         throw DeliveryStoreAdmissionException(
@@ -737,9 +747,9 @@ private fun AndroidDeliveryStore.importExpiredLegacyDelivery(
 
     val tombstoneValues = ContentValues().apply {
         put("delivery_id", deliveryObject.deliveryId.value)
-        put("reason", TombstoneReason.EXPIRED.name)
+        put("reason", tombstoneReason.name)
         put("created_at_ms", nowMs)
-        put("expires_at_ms", Long.MAX_VALUE)
+        put("expires_at_ms", tombstoneExpiresAtMs)
     }
     database.insertWithOnConflict(
         DeliverySchema.TOMBSTONES,
@@ -748,10 +758,12 @@ private fun AndroidDeliveryStore.importExpiredLegacyDelivery(
         SQLiteDatabase.CONFLICT_REPLACE,
     ).also { check(it != -1L) }
     transaction.markChanged()
-    transaction.appendOutbox(
-        listOf(DeliveryStoreEvent.DeliveryExpired(deliveryObject.deliveryId)),
-        nowMs,
-    )
+    if (emitExpiredEvent) {
+        transaction.appendOutbox(
+            listOf(DeliveryStoreEvent.DeliveryExpired(deliveryObject.deliveryId)),
+            nowMs,
+        )
+    }
 }
 
 private suspend fun AndroidDeliveryStore.verifyLegacyImport(
@@ -1036,14 +1048,27 @@ private fun hasInventedLegacyFacts(
 
 private fun LegacyPacketEntry.dispositionFor(
     localNodeId: NodeId,
+): LegacyDeliveryDisposition = legacyV1Disposition(envelope, localNodeId)
+
+internal fun legacyV1Disposition(
+    envelope: MeshEnvelope,
+    localNodeId: NodeId,
 ): LegacyDeliveryDisposition = when (envelope.destinationNodeId) {
     null -> LegacyDeliveryDisposition.BROADCAST_FORWARDABLE
     localNodeId.value -> LegacyDeliveryDisposition.LOCAL_QUARANTINED
     else -> LegacyDeliveryDisposition.REMOTE_FORWARDABLE
 }
 
-private fun LegacyPacketEntry.toDeliveryObject(): DeliveryObject = DeliveryObject.copyOf(
-    deliveryId = deliveryId,
+private fun LegacyPacketEntry.toDeliveryObject(): DeliveryObject = legacyV1DeliveryObject(
+    envelope = envelope,
+    canonicalBytes = canonicalBytes,
+)
+
+internal fun legacyV1DeliveryObject(
+    envelope: MeshEnvelope,
+    canonicalBytes: ByteArray = MeshEnvelopeCodec.encode(envelope),
+): DeliveryObject = DeliveryObject.copyOf(
+    deliveryId = DeliveryId(envelope.packetId),
     destination = envelope.destinationNodeId?.let(::legacyNodeEndpoint)
         ?: EndpointId("dtn://openmesh/legacy-v1/broadcast"),
     source = legacyNodeEndpoint(envelope.sourceNodeId),
@@ -1052,7 +1077,7 @@ private fun LegacyPacketEntry.toDeliveryObject(): DeliveryObject = DeliveryObjec
     canonicalBytes = canonicalBytes,
 )
 
-private fun legacyNodeEndpoint(nodeId: String): EndpointId {
+internal fun legacyNodeEndpoint(nodeId: String): EndpointId {
     val encoded = URLEncoder.encode(nodeId, StandardCharsets.UTF_8.name())
         .replace("+", "%20")
     return EndpointId("dtn://openmesh/legacy-v1/node/$encoded")
