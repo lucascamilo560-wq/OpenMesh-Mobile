@@ -131,16 +131,16 @@ class LegacyV1RuntimeCutoverCoordinatorTest {
                 )
             )
             val preparing = async(Dispatchers.Default) {
-                coordinator.prepare(nowMs = 100)
+                runCatching { coordinator.prepare(nowMs = 100) }
             }
 
             assertTrue(ownerCommitted.await(5, TimeUnit.SECONDS))
             coordinator.close()
             resumePreparation.countDown()
-            expectSuspendThrows(LegacyV1CutoverException::class.java) {
-                preparing.await()
-            }
+            val outcome = preparing.await()
 
+            assertNull(outcome.getOrNull())
+            assertTrue(outcome.exceptionOrNull() is LegacyV1CutoverException)
             assertTrue(unpublishedStoreClosed.await(5, TimeUnit.SECONDS))
             expectSuspendThrows(LegacyV1CutoverException::class.java) {
                 coordinator.prepare(nowMs = 101)
