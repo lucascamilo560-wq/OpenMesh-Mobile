@@ -295,14 +295,14 @@ class OpenMeshDeliveryDatabaseMigrationTest {
             putNullable("finished_at_ms", finishedAtMs)
             putNullable("failure_reason", failureReason)
         }
-    }
 
-    private fun ContentValues.putNullable(key: String, value: Long?) {
-        if (value == null) putNull(key) else put(key, value)
-    }
+        private fun ContentValues.putNullable(key: String, value: Long?) {
+            if (value == null) putNull(key) else put(key, value)
+        }
 
-    private fun ContentValues.putNullable(key: String, value: String?) {
-        if (value == null) putNull(key) else put(key, value)
+        private fun ContentValues.putNullable(key: String, value: String?) {
+            if (value == null) putNull(key) else put(key, value)
+        }
     }
 
     private companion object {
