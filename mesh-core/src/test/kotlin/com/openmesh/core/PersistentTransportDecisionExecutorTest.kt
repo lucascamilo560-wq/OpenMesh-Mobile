@@ -338,18 +338,27 @@ class PersistentTransportDecisionExecutorTest {
     @Test
     fun `cancellation is rethrown after non-cancellable failed settlement`() = runBlocking {
         val store = waitingStore("executor-cancel")
+        val entered = CompletableDeferred<Unit>()
         val cancellation = CancellationException("cancel execution")
-        val adapter = RecordingAdapter { throw cancellation }
-
-        val thrown = expectSuspendThrows<CancellationException> {
+        val adapter = RecordingAdapter { _ ->
+            entered.complete(Unit)
+            awaitCancellation()
+        }
+        val execution = async(start = CoroutineStart.UNDISPATCHED) {
             executor(store, adapter).execute(
                 DeliveryId("executor-cancel"),
                 transferDecision(),
             )
         }
+        entered.await()
+        execution.cancel(cancellation)
+
+        val thrown = expectSuspendThrows<CancellationException> {
+            execution.await()
+        }
         val attempt = store.snapshot(DeliveryId("executor-cancel")).transferAttempts.single()
 
-        assertSame(cancellation, thrown)
+        assertEquals(cancellation.message, thrown.message)
         assertEquals(TransferAttemptState.FAILED, attempt.state)
         assertEquals(PersistentTransportFailureReason.EXECUTION_CANCELLED.name, attempt.failureReason)
     }
