@@ -462,6 +462,7 @@ class PersistentTransportDecisionExecutorTest {
         val entered = CompletableDeferred<Unit>()
         val interrupted = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
+        val observedCancellation = CompletableDeferred<CancellationException>()
         val settlementFailure = SimulatedFailure("non-cancellable settlement failed")
         var settlementCalls = 0
         tracking.beforeLinkWrite = {
@@ -480,10 +481,15 @@ class PersistentTransportDecisionExecutorTest {
             }
         }
         val execution = async(start = CoroutineStart.UNDISPATCHED) {
-            executor(tracking, RecordingAdapter()).execute(
-                DeliveryId("executor-cancel-settlement-fails"),
-                transferDecision(),
-            )
+            try {
+                executor(tracking, RecordingAdapter()).execute(
+                    DeliveryId("executor-cancel-settlement-fails"),
+                    transferDecision(),
+                )
+            } catch (cancelled: CancellationException) {
+                observedCancellation.complete(cancelled)
+                throw cancelled
+            }
         }
         entered.await()
         val cancellation = CancellationException("cancel and fail settlement")
@@ -491,7 +497,8 @@ class PersistentTransportDecisionExecutorTest {
         interrupted.await()
         release.complete(Unit)
 
-        val thrown = expectSuspendThrows<CancellationException> { execution.await() }
+        val thrown = observedCancellation.await()
+        val callerCancellation = expectSuspendThrows<CancellationException> { execution.await() }
         val suppressed = thrown.suppressed.single {
             it is TransportExecutionSettlementException
         } as TransportExecutionSettlementException
@@ -499,6 +506,7 @@ class PersistentTransportDecisionExecutorTest {
             .transferAttempts.single()
 
         assertEquals(cancellation.message, thrown.message)
+        assertEquals(cancellation.message, callerCancellation.message)
         assertSame(settlementFailure, suppressed.cause)
         assertSame(PersistentLocalTransportOutcome.CompletedLocally, suppressed.localOutcome)
         assertEquals(TransferAttemptState.TRANSFERRING, attempt.state)
