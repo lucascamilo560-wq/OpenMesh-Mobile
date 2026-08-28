@@ -22,6 +22,7 @@ import com.openmesh.core.TransportPeer
 import com.openmesh.core.TransportTransferRequest
 import com.openmesh.core.TransportTransferResult
 import java.security.SecureRandom
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +37,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 
 /**
@@ -54,6 +56,11 @@ class BleTransportAdapter internal constructor(
     private val contactValidityMs: Long = DEFAULT_CONTACT_VALIDITY_MS,
     private val expirationSweepIntervalMs: Long = DEFAULT_EXPIRATION_SWEEP_INTERVAL_MS,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val maxActiveOpportunities: Int = DEFAULT_MAX_ACTIVE_OPPORTUNITIES,
+    private val maxConcurrentIdentityResolutions: Int =
+        DEFAULT_MAX_CONCURRENT_IDENTITY_RESOLUTIONS,
+    private val beforeEventPublication: suspend (TransportEvent) -> Unit = {},
+    private val beforeTransferSend: suspend () -> Unit = {},
 ) : TransportAdapter {
 
     constructor(
@@ -76,17 +83,37 @@ class BleTransportAdapter internal constructor(
         require(expirationSweepIntervalMs > 0) {
             "BLE expiration sweep interval must be positive"
         }
+        require(maxActiveOpportunities > 0) {
+            "BLE active opportunity limit must be positive"
+        }
+        require(maxConcurrentIdentityResolutions > 0) {
+            "BLE identity concurrency limit must be positive"
+        }
+        require(maxConcurrentIdentityResolutions <= maxActiveOpportunities) {
+            "BLE identity concurrency cannot exceed the active opportunity limit"
+        }
     }
 
     override val adapterId: TransportAdapterId = ADAPTER_ID
 
-    private val mutableEvents = MutableSharedFlow<TransportEvent>(extraBufferCapacity = 256)
+    private val mutableEvents = MutableSharedFlow<TransportEvent>(
+        extraBufferCapacity = EVENT_BUFFER_CAPACITY,
+    )
     override val events: Flow<TransportEvent> = mutableEvents.asSharedFlow()
+
+    /** Serializes complete physical start/stop operations, not only logical state changes. */
+    private val lifecycleOperationMutex = Mutex()
+
+    /** Serializes transfer authorization, the actual GATT send, and the stop barrier. */
+    private val transferOperationMutex = Mutex()
+
+    /** Serializes state transitions with their lossless, backpressured event publication. */
+    private val eventTransitionMutex = Mutex()
 
     private val lifecycleMutex = Mutex()
     private val currentByAddress = linkedMapOf<String, CurrentBleOpportunity>()
     private val currentByKey = linkedMapOf<TransportOpportunityKey, CurrentBleOpportunity>()
-    private val issuedOpportunityIds = mutableSetOf<TransportOpportunityId>()
+    private val identityResolutionPermits = Semaphore(maxConcurrentIdentityResolutions)
 
     private var lifecycleState = LifecycleState.STOPPED
 
@@ -94,339 +121,437 @@ class BleTransportAdapter internal constructor(
     private var runScope: CoroutineScope? = null
 
     override suspend fun start() {
-        lifecycleMutex.withLock {
-            if (lifecycleState == LifecycleState.RUNNING) return
+        lifecycleOperationMutex.withLock {
+            lifecycleMutex.withLock {
+                if (lifecycleState == LifecycleState.RUNNING) return
 
-            val scope = CoroutineScope(SupervisorJob() + dispatcher)
-            runScope = scope
-            var serverStarted = false
-            var advertiserStarted = false
-            var scannerStarted = false
+                val scope = CoroutineScope(SupervisorJob() + dispatcher)
+                runScope = scope
+                var serverStarted = false
+                var advertiserStarted = false
+                var scannerStarted = false
 
-            try {
-                if (!platform.startServer(::onOpaqueInbound)) {
-                    throw BleTransportStartException(BleTransportStartStage.GATT_SERVER)
-                }
-                serverStarted = true
+                try {
+                    if (
+                        !platform.startServer(
+                            onBytes = { deviceAddress, bytes ->
+                                onOpaqueInbound(
+                                    deviceAddress = deviceAddress,
+                                    bytes = bytes,
+                                    expectedScope = scope,
+                                )
+                            },
+                        )
+                    ) {
+                        throw BleTransportStartException(BleTransportStartStage.GATT_SERVER)
+                    }
+                    serverStarted = true
 
-                if (!platform.startAdvertising()) {
-                    throw BleTransportStartException(BleTransportStartStage.ADVERTISER)
-                }
-                advertiserStarted = true
+                    if (!platform.startAdvertising()) {
+                        throw BleTransportStartException(BleTransportStartStage.ADVERTISER)
+                    }
+                    advertiserStarted = true
 
-                lifecycleState = LifecycleState.RUNNING
-                if (!platform.startScanning(::dispatchAdvertisement)) {
-                    throw BleTransportStartException(BleTransportStartStage.SCANNER)
-                }
-                scannerStarted = true
+                    lifecycleState = LifecycleState.RUNNING
+                    if (
+                        !platform.startScanning(
+                            onAdvertisement = { advertisement ->
+                                scope.launch {
+                                    observeAdvertisement(
+                                        advertisement = advertisement,
+                                        expectedScope = scope,
+                                    )
+                                }
+                            },
+                        )
+                    ) {
+                        throw BleTransportStartException(BleTransportStartStage.SCANNER)
+                    }
+                    scannerStarted = true
 
-                scope.launch { expirationLoop() }
-            } catch (error: Throwable) {
-                lifecycleState = LifecycleState.STOPPED
-                runScope = null
-                scope.cancel()
-                if (scannerStarted) runCatching { platform.stopScanning() }
-                if (advertiserStarted) runCatching { platform.stopAdvertising() }
-                if (serverStarted) runCatching { platform.stopServer() }
-                throw if (error is BleTransportStartException) {
-                    error
-                } else {
-                    BleTransportStartException(
-                        stage = when {
-                            !serverStarted -> BleTransportStartStage.GATT_SERVER
-                            !advertiserStarted -> BleTransportStartStage.ADVERTISER
-                            else -> BleTransportStartStage.SCANNER
-                        },
-                        cause = error,
-                    )
+                    scope.launch { expirationLoop() }
+                } catch (error: Throwable) {
+                    lifecycleState = LifecycleState.STOPPED
+                    runScope = null
+                    scope.cancel()
+                    if (scannerStarted) runCatching { platform.stopScanning() }
+                    if (advertiserStarted) runCatching { platform.stopAdvertising() }
+                    if (serverStarted) runCatching { platform.stopServer() }
+                    throw if (error is BleTransportStartException) {
+                        error
+                    } else {
+                        BleTransportStartException(
+                            stage = when {
+                                !serverStarted -> BleTransportStartStage.GATT_SERVER
+                                !advertiserStarted -> BleTransportStartStage.ADVERTISER
+                                else -> BleTransportStartStage.SCANNER
+                            },
+                            cause = error,
+                        )
+                    }
                 }
             }
         }
     }
 
     override suspend fun stop() {
-        val stoppedAtMs = nowMs()
-        val shutdown = lifecycleMutex.withLock {
-            if (lifecycleState == LifecycleState.STOPPED) return
-            lifecycleState = LifecycleState.STOPPED
-            val scope = runScope
-            runScope = null
+        lifecycleOperationMutex.lock()
+        try {
+            transferOperationMutex.lock()
+            try {
+                val stoppedAtMs = nowMs()
+                eventTransitionMutex.lock()
+                val shutdown = try {
+                    val value = lifecycleMutex.withLock {
+                        if (lifecycleState == LifecycleState.STOPPED) return
+                        lifecycleState = LifecycleState.STOPPED
+                        val scope = runScope
+                        runScope = null
 
-            val unavailableEvents = currentByAddress.values.map { current ->
-                TransportEvent.OpportunityUnavailable(
-                    opportunity = current.opportunity.reference,
-                    occurredAtMs = stoppedAtMs,
-                    reason = TransportOpportunityUnavailableReason.ADAPTER_STOPPED,
-                )
+                        val unavailableEvents = currentByAddress.values.map { current ->
+                            TransportEvent.OpportunityUnavailable(
+                                opportunity = current.opportunity.reference,
+                                occurredAtMs = stoppedAtMs,
+                                reason = TransportOpportunityUnavailableReason.ADAPTER_STOPPED,
+                            )
+                        }
+                        currentByAddress.clear()
+                        currentByKey.clear()
+                        Shutdown(scope = scope, unavailableEvents = unavailableEvents)
+                    }
+                    publishEvents(value.unavailableEvents)
+                    value
+                } finally {
+                    eventTransitionMutex.unlock()
+                }
+
+                shutdown.scope?.coroutineContext?.get(Job)?.cancelAndJoin()
+                runCatching { platform.stopScanning() }
+                runCatching { platform.stopAdvertising() }
+                runCatching { platform.stopServer() }
+            } finally {
+                transferOperationMutex.unlock()
             }
-            currentByAddress.clear()
-            currentByKey.clear()
-            Shutdown(scope = scope, unavailableEvents = unavailableEvents)
+        } finally {
+            lifecycleOperationMutex.unlock()
         }
-
-        shutdown.scope?.coroutineContext?.get(Job)?.cancelAndJoin()
-        runCatching { platform.stopScanning() }
-        runCatching { platform.stopAdvertising() }
-        runCatching { platform.stopServer() }
-        shutdown.unavailableEvents.forEach { mutableEvents.emit(it) }
     }
 
     override suspend fun transfer(request: TransportTransferRequest): TransportTransferResult {
-        val now = nowMs()
-        var expirationEvent: TransportEvent.OpportunityUnavailable? = null
+        transferOperationMutex.lock()
+        try {
+            val now = nowMs()
+            var expirationEvent: TransportEvent.OpportunityUnavailable? = null
 
-        val authorization = lifecycleMutex.withLock {
-            when {
-                request.opportunity.adapterId != adapterId ->
-                    TransferAuthorization.Rejected(
-                        TransportTransferResult.FailedLocally(
-                            transferId = request.transferId,
-                            occurredAtMs = now,
-                            failure = TransportLocalFailure(
-                                code = TransportLocalFailureCode.INVALID_REQUEST,
-                                detail = "Transfer opportunity belongs to another adapter",
-                            ),
-                        ),
-                    )
-
-                lifecycleState != LifecycleState.RUNNING ->
-                    TransferAuthorization.Rejected(
-                        TransportTransferResult.FailedLocally(
-                            transferId = request.transferId,
-                            occurredAtMs = now,
-                            failure = TransportLocalFailure(
-                                code = TransportLocalFailureCode.ADAPTER_STOPPED,
-                            ),
-                        ),
-                    )
-
-                else -> {
-                    val current = currentByKey[request.opportunity.key]
+            eventTransitionMutex.lock()
+            val authorization = try {
+                val value = lifecycleMutex.withLock {
                     when {
-                        current == null || current.opportunity.reference != request.opportunity ->
-                            TransferAuthorization.Rejected(
-                                unavailable(request, now),
-                            )
-
-                        !current.opportunity.isFreshAt(now) -> {
-                            expirationEvent = terminalizeLocked(
-                                current = current,
-                                occurredAtMs = now,
-                                reason = TransportOpportunityUnavailableReason.EXPIRED,
-                            )
-                            TransferAuthorization.Rejected(unavailable(request, now))
-                        }
-
-                        !current.opportunity.direction.isSendKnown ->
+                        request.opportunity.adapterId != adapterId ->
                             TransferAuthorization.Rejected(
                                 TransportTransferResult.FailedLocally(
                                     transferId = request.transferId,
                                     occurredAtMs = now,
                                     failure = TransportLocalFailure(
-                                        code = TransportLocalFailureCode.UNSUPPORTED,
-                                        detail = "Opportunity is not explicitly send-capable",
+                                        code = TransportLocalFailureCode.INVALID_REQUEST,
+                                        detail = "Transfer opportunity belongs to another adapter",
                                     ),
                                 ),
                             )
 
-                        else -> TransferAuthorization.Approved(
-                            deviceAddress = current.deviceAddress,
-                            bytes = request.bytes,
-                        )
+                        lifecycleState != LifecycleState.RUNNING ->
+                            TransferAuthorization.Rejected(
+                                TransportTransferResult.FailedLocally(
+                                    transferId = request.transferId,
+                                    occurredAtMs = now,
+                                    failure = TransportLocalFailure(
+                                        code = TransportLocalFailureCode.ADAPTER_STOPPED,
+                                    ),
+                                ),
+                            )
+
+                        else -> {
+                            val current = currentByKey[request.opportunity.key]
+                            when {
+                                current == null ||
+                                    current.opportunity.reference != request.opportunity ->
+                                    TransferAuthorization.Rejected(
+                                        unavailable(request, now),
+                                    )
+
+                                !current.opportunity.isFreshAt(now) -> {
+                                    expirationEvent = terminalizeLocked(
+                                        current = current,
+                                        occurredAtMs = now,
+                                        reason = TransportOpportunityUnavailableReason.EXPIRED,
+                                    )
+                                    TransferAuthorization.Rejected(unavailable(request, now))
+                                }
+
+                                !current.opportunity.direction.isSendKnown ->
+                                    TransferAuthorization.Rejected(
+                                        TransportTransferResult.FailedLocally(
+                                            transferId = request.transferId,
+                                            occurredAtMs = now,
+                                            failure = TransportLocalFailure(
+                                                code = TransportLocalFailureCode.UNSUPPORTED,
+                                                detail = "Opportunity is not explicitly send-capable",
+                                            ),
+                                        ),
+                                    )
+
+                                else -> TransferAuthorization.Approved(
+                                    deviceAddress = current.deviceAddress,
+                                    bytes = request.bytes,
+                                )
+                            }
+                        }
                     }
                 }
+                expirationEvent?.let { publishEvent(it) }
+                value
+            } finally {
+                eventTransitionMutex.unlock()
             }
-        }
 
-        expirationEvent?.let { mutableEvents.emit(it) }
-        if (authorization is TransferAuthorization.Rejected) return authorization.result
-        authorization as TransferAuthorization.Approved
+            if (authorization is TransferAuthorization.Rejected) return authorization.result
+            authorization as TransferAuthorization.Approved
 
-        val result = try {
-            platform.sendBytes(
-                deviceAddress = authorization.deviceAddress,
-                bytes = authorization.bytes.copyToByteArray(),
-            )
-        } catch (_: SecurityException) {
-            return failedLocally(
-                request = request,
-                code = TransportLocalFailureCode.PERMISSION_DENIED,
-            )
-        } catch (_: Throwable) {
-            return failedLocally(
-                request = request,
-                code = TransportLocalFailureCode.IO_ERROR,
-            )
-        }
+            beforeTransferSend()
+            val result = try {
+                platform.sendBytes(
+                    deviceAddress = authorization.deviceAddress,
+                    bytes = authorization.bytes.copyToByteArray(),
+                )
+            } catch (_: SecurityException) {
+                return failedLocally(
+                    request = request,
+                    code = TransportLocalFailureCode.PERMISSION_DENIED,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                return failedLocally(
+                    request = request,
+                    code = TransportLocalFailureCode.IO_ERROR,
+                )
+            }
 
-        return when (result) {
-            is BleGattSendResult.Success -> TransportTransferResult.CompletedLocally(
-                transferId = request.transferId,
-                occurredAtMs = nowMs(),
-            )
+            return when (result) {
+                is BleGattSendResult.Success -> TransportTransferResult.CompletedLocally(
+                    transferId = request.transferId,
+                    occurredAtMs = nowMs(),
+                )
 
-            is BleGattSendResult.Failed -> failedLocally(
-                request = request,
-                code = result.kind.toTransportFailureCode(),
-                detail = buildGattFailureDetail(result),
-            )
+                is BleGattSendResult.Failed -> failedLocally(
+                    request = request,
+                    code = result.kind.toTransportFailureCode(),
+                    detail = buildGattFailureDetail(result),
+                )
+            }
+        } finally {
+            transferOperationMutex.unlock()
         }
     }
 
     /** Deterministic seam used by tests and by the production expiration loop. */
     internal suspend fun expireStaleOpportunities() {
-        val now = nowMs()
-        val expired = lifecycleMutex.withLock {
-            if (lifecycleState != LifecycleState.RUNNING) return@withLock emptyList()
-            currentByAddress.values
-                .filter { !it.opportunity.isFreshAt(now) }
-                .toList()
-                .map { current ->
-                    terminalizeLocked(
-                        current = current,
-                        occurredAtMs = now,
-                        reason = TransportOpportunityUnavailableReason.EXPIRED,
-                    )
-                }
+        eventTransitionMutex.lock()
+        try {
+            val now = nowMs()
+            val expired = lifecycleMutex.withLock {
+                if (lifecycleState != LifecycleState.RUNNING) return@withLock emptyList()
+                currentByAddress.values
+                    .filter { !it.opportunity.isFreshAt(now) }
+                    .toList()
+                    .map { current ->
+                        terminalizeLocked(
+                            current = current,
+                            occurredAtMs = now,
+                            reason = TransportOpportunityUnavailableReason.EXPIRED,
+                        )
+                    }
+            }
+            publishEvents(expired)
+        } finally {
+            eventTransitionMutex.unlock()
         }
-        expired.forEach { mutableEvents.emit(it) }
     }
 
     /** Deterministic scan seam; the Android scanner dispatches through this path. */
-    internal suspend fun observeAdvertisement(advertisement: PeerAdvertisement) {
+    internal suspend fun observeAdvertisement(
+        advertisement: PeerAdvertisement,
+        expectedScope: CoroutineScope? = null,
+    ) {
         if (advertisement.seenAtMs < 0 || advertisement.deviceAddress.isBlank()) return
         val addressBytes = advertisement.deviceAddress.encodeToByteArray()
         if (addressBytes.size > TransportAddress.MAX_BYTES) return
 
         val emitted = mutableListOf<TransportEvent>()
-        var identityLifecycle: Pair<String, TransportOpportunityId>? = null
-        val scope = lifecycleMutex.withLock {
-            if (lifecycleState != LifecycleState.RUNNING) return@withLock null
+        var identityRequest: IdentityResolutionRequest? = null
+        eventTransitionMutex.lock()
+        try {
+            lifecycleMutex.withLock {
+                if (lifecycleState != LifecycleState.RUNNING) return@withLock
+                if (expectedScope != null && runScope !== expectedScope) return@withLock
 
-            val existing = currentByAddress[advertisement.deviceAddress]
-            val current = when {
-                existing == null -> {
-                    createOpportunityLocked(advertisement).also { created ->
-                        emitted += TransportEvent.OpportunityAvailable(created.opportunity)
+                val existing = currentByAddress[advertisement.deviceAddress]
+                val current = when {
+                    existing == null -> {
+                        createOpportunityLocked(advertisement)?.also { created ->
+                            emitted += TransportEvent.OpportunityAvailable(created.opportunity)
+                        }
+                    }
+
+                    advertisement.seenAtMs < existing.opportunity.observedAtMs -> existing
+
+                    advertisement.seenAtMs >= existing.opportunity.validUntilMs -> {
+                        emitted += terminalizeLocked(
+                            current = existing,
+                            occurredAtMs = advertisement.seenAtMs,
+                            reason = TransportOpportunityUnavailableReason.EXPIRED,
+                        )
+                        createOpportunityLocked(advertisement)?.also { created ->
+                            emitted += TransportEvent.OpportunityAvailable(created.opportunity)
+                        }
+                    }
+
+                    existing.opportunity.revision.value == Long.MAX_VALUE -> {
+                        emitted += terminalizeLocked(
+                            current = existing,
+                            occurredAtMs = advertisement.seenAtMs,
+                            reason = TransportOpportunityUnavailableReason.REPLACED,
+                        )
+                        createOpportunityLocked(advertisement)?.also { created ->
+                            emitted += TransportEvent.OpportunityAvailable(created.opportunity)
+                        }
+                    }
+
+                    else -> {
+                        val previous = existing.opportunity.reference
+                        existing.opportunity = existing.opportunity.copy(
+                            revision = TransportOpportunityRevision(
+                                existing.opportunity.revision.value + 1,
+                            ),
+                            observedAtMs = advertisement.seenAtMs,
+                            validUntilMs = validUntil(advertisement.seenAtMs),
+                        )
+                        emitted += TransportEvent.OpportunityChanged(
+                            previous = previous,
+                            opportunity = existing.opportunity,
+                        )
+                        existing
                     }
                 }
 
-                advertisement.seenAtMs < existing.opportunity.observedAtMs -> existing
-
-                advertisement.seenAtMs >= existing.opportunity.validUntilMs -> {
-                    emitted += terminalizeLocked(
-                        current = existing,
-                        occurredAtMs = advertisement.seenAtMs,
-                        reason = TransportOpportunityUnavailableReason.EXPIRED,
+                val activeScope = runScope
+                if (
+                    current != null &&
+                    activeScope != null &&
+                    current.opportunity.peer == TransportPeer.Unknown &&
+                    !current.identityResolutionActive &&
+                    identityResolutionPermits.tryAcquire()
+                ) {
+                    current.identityResolutionActive = true
+                    identityRequest = IdentityResolutionRequest(
+                        scope = activeScope,
+                        deviceAddress = current.deviceAddress,
+                        opportunityId = current.opportunity.opportunityId,
                     )
-                    createOpportunityLocked(advertisement).also { created ->
-                        emitted += TransportEvent.OpportunityAvailable(created.opportunity)
-                    }
-                }
-
-                existing.opportunity.revision.value == Long.MAX_VALUE -> {
-                    emitted += terminalizeLocked(
-                        current = existing,
-                        occurredAtMs = advertisement.seenAtMs,
-                        reason = TransportOpportunityUnavailableReason.REPLACED,
-                    )
-                    createOpportunityLocked(advertisement).also { created ->
-                        emitted += TransportEvent.OpportunityAvailable(created.opportunity)
-                    }
-                }
-
-                else -> {
-                    val previous = existing.opportunity.reference
-                    existing.opportunity = existing.opportunity.copy(
-                        revision = TransportOpportunityRevision(
-                            existing.opportunity.revision.value + 1,
-                        ),
-                        observedAtMs = advertisement.seenAtMs,
-                        validUntilMs = validUntil(advertisement.seenAtMs),
-                    )
-                    emitted += TransportEvent.OpportunityChanged(
-                        previous = previous,
-                        opportunity = existing.opportunity,
-                    )
-                    existing
                 }
             }
-
-            if (current.opportunity.peer == TransportPeer.Unknown && !current.identityResolutionActive) {
-                current.identityResolutionActive = true
-                identityLifecycle = current.deviceAddress to current.opportunity.opportunityId
-            }
-            runScope
+            publishEvents(emitted)
+        } finally {
+            eventTransitionMutex.unlock()
         }
 
-        emitted.forEach { mutableEvents.emit(it) }
-        val resolution = identityLifecycle
-        if (scope != null && resolution != null) {
-            scope.launch {
+        identityRequest?.let { request ->
+            val job = request.scope.launch {
                 resolveIdentity(
-                    deviceAddress = resolution.first,
-                    opportunityId = resolution.second,
+                    deviceAddress = request.deviceAddress,
+                    opportunityId = request.opportunityId,
+                    expectedScope = request.scope,
                 )
             }
+            job.invokeOnCompletion { identityResolutionPermits.release() }
         }
-    }
-
-    private fun dispatchAdvertisement(advertisement: PeerAdvertisement) {
-        runScope?.launch { observeAdvertisement(advertisement) }
     }
 
     private suspend fun resolveIdentity(
         deviceAddress: String,
         opportunityId: TransportOpportunityId,
+        expectedScope: CoroutineScope,
     ) {
-        val identity = runCatching { platform.resolveIdentity(deviceAddress) }.getOrNull()
+        val identity = try {
+            platform.resolveIdentity(deviceAddress)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            null
+        }
         val now = nowMs()
         var event: TransportEvent? = null
 
-        lifecycleMutex.withLock {
-            val current = currentByAddress[deviceAddress]
-            if (current == null || current.opportunity.opportunityId != opportunityId) return@withLock
-            current.identityResolutionActive = false
-            if (lifecycleState != LifecycleState.RUNNING || identity == null) return@withLock
+        eventTransitionMutex.lock()
+        try {
+            lifecycleMutex.withLock {
+                val current = currentByAddress[deviceAddress]
+                if (current == null || current.opportunity.opportunityId != opportunityId) {
+                    return@withLock
+                }
+                current.identityResolutionActive = false
+                if (
+                    lifecycleState != LifecycleState.RUNNING ||
+                    runScope !== expectedScope ||
+                    identity == null
+                ) {
+                    return@withLock
+                }
 
-            if (!current.opportunity.isFreshAt(now)) {
-                event = terminalizeLocked(
-                    current = current,
-                    occurredAtMs = now,
-                    reason = TransportOpportunityUnavailableReason.EXPIRED,
+                if (!current.opportunity.isFreshAt(now)) {
+                    event = terminalizeLocked(
+                        current = current,
+                        occurredAtMs = now,
+                        reason = TransportOpportunityUnavailableReason.EXPIRED,
+                    )
+                    return@withLock
+                }
+
+                val knownNode = runCatching { TransportPeer.KnownNode(NodeId(identity.nodeId)) }
+                    .getOrNull() ?: return@withLock
+                if (current.opportunity.peer == knownNode) return@withLock
+                if (current.opportunity.revision.value == Long.MAX_VALUE) {
+                    event = terminalizeLocked(
+                        current = current,
+                        occurredAtMs = now,
+                        reason = TransportOpportunityUnavailableReason.REPLACED,
+                    )
+                    return@withLock
+                }
+
+                val previous = current.opportunity.reference
+                val resolvedAtMs = maxOf(now, current.opportunity.observedAtMs)
+                current.opportunity = current.opportunity.copy(
+                    revision = TransportOpportunityRevision(current.opportunity.revision.value + 1),
+                    observedAtMs = resolvedAtMs,
+                    peer = knownNode,
                 )
-                return@withLock
-            }
-
-            val knownNode = runCatching { TransportPeer.KnownNode(NodeId(identity.nodeId)) }
-                .getOrNull() ?: return@withLock
-            if (current.opportunity.peer == knownNode) return@withLock
-            if (current.opportunity.revision.value == Long.MAX_VALUE) {
-                event = terminalizeLocked(
-                    current = current,
-                    occurredAtMs = now,
-                    reason = TransportOpportunityUnavailableReason.REPLACED,
+                event = TransportEvent.OpportunityChanged(
+                    previous = previous,
+                    opportunity = current.opportunity,
                 )
-                return@withLock
             }
-
-            val previous = current.opportunity.reference
-            val resolvedAtMs = maxOf(now, current.opportunity.observedAtMs)
-            current.opportunity = current.opportunity.copy(
-                revision = TransportOpportunityRevision(current.opportunity.revision.value + 1),
-                observedAtMs = resolvedAtMs,
-                peer = knownNode,
-            )
-            event = TransportEvent.OpportunityChanged(
-                previous = previous,
-                opportunity = current.opportunity,
-            )
+            event?.let { publishEvent(it) }
+        } finally {
+            eventTransitionMutex.unlock()
         }
-
-        event?.let { mutableEvents.emit(it) }
     }
 
-    private suspend fun onOpaqueInbound(deviceAddress: String, bytes: ByteArray) {
+    private suspend fun onOpaqueInbound(
+        deviceAddress: String,
+        bytes: ByteArray,
+        expectedScope: CoroutineScope? = null,
+    ) {
         if (deviceAddress.isBlank() || bytes.isEmpty()) return
         if (bytes.size > TransportContractLimits.MAX_OPAQUE_BYTES) return
         val addressBytes = deviceAddress.encodeToByteArray()
@@ -434,36 +559,42 @@ class BleTransportAdapter internal constructor(
 
         val now = nowMs()
         var expired: TransportEvent.OpportunityUnavailable? = null
-        val inbound = lifecycleMutex.withLock {
-            if (lifecycleState != LifecycleState.RUNNING) return@withLock null
-            var current = currentByAddress[deviceAddress]
-            if (current != null && !current.opportunity.isFreshAt(now)) {
-                expired = terminalizeLocked(
-                    current = current,
+        eventTransitionMutex.lock()
+        try {
+            val inbound = lifecycleMutex.withLock {
+                if (lifecycleState != LifecycleState.RUNNING) return@withLock null
+                if (expectedScope != null && runScope !== expectedScope) return@withLock null
+                var current = currentByAddress[deviceAddress]
+                if (current != null && !current.opportunity.isFreshAt(now)) {
+                    expired = terminalizeLocked(
+                        current = current,
+                        occurredAtMs = now,
+                        reason = TransportOpportunityUnavailableReason.EXPIRED,
+                    )
+                    current = null
+                }
+
+                TransportEvent.InboundBytes.copyOf(
+                    adapterId = adapterId,
+                    opportunity = current?.opportunity?.reference,
+                    peer = current?.opportunity?.peer ?: TransportPeer.Unknown,
+                    sourceAddress = TransportAddress.copyOf(adapterId, addressBytes),
                     occurredAtMs = now,
-                    reason = TransportOpportunityUnavailableReason.EXPIRED,
+                    bytes = bytes,
                 )
-                current = null
             }
-
-            TransportEvent.InboundBytes.copyOf(
-                adapterId = adapterId,
-                opportunity = current?.opportunity?.reference,
-                peer = current?.opportunity?.peer ?: TransportPeer.Unknown,
-                sourceAddress = TransportAddress.copyOf(adapterId, addressBytes),
-                occurredAtMs = now,
-                bytes = bytes,
-            )
+            expired?.let { publishEvent(it) }
+            inbound?.let { publishEvent(it) }
+        } finally {
+            eventTransitionMutex.unlock()
         }
-
-        expired?.let { mutableEvents.emit(it) }
-        inbound?.let { mutableEvents.emit(it) }
     }
 
     private fun createOpportunityLocked(
         advertisement: PeerAdvertisement,
-    ): CurrentBleOpportunity {
-        val opportunityId = nextUniqueOpportunityIdLocked()
+    ): CurrentBleOpportunity? {
+        if (currentByAddress.size >= maxActiveOpportunities) return null
+        val opportunityId = nextOpportunityIdLocked()
         val opportunity = TransportOpportunity(
             adapterId = adapterId,
             opportunityId = opportunityId,
@@ -500,12 +631,12 @@ class BleTransportAdapter internal constructor(
         )
     }
 
-    private fun nextUniqueOpportunityIdLocked(): TransportOpportunityId {
-        repeat(MAX_ID_COLLISION_RETRIES) {
-            val candidate = opportunityIdGenerator.nextId()
-            if (issuedOpportunityIds.add(candidate)) return candidate
+    private fun nextOpportunityIdLocked(): TransportOpportunityId {
+        val candidate = opportunityIdGenerator.nextId()
+        check(currentByKey.keys.none { it.opportunityId == candidate }) {
+            "BLE opportunity ID generator reused an active lifecycle ID"
         }
-        throw IllegalStateException("BLE opportunity ID generator repeatedly collided")
+        return candidate
     }
 
     private fun validUntil(observedAtMs: Long): Long {
@@ -521,6 +652,17 @@ class BleTransportAdapter internal constructor(
             delay(expirationSweepIntervalMs)
             expireStaleOpportunities()
         }
+    }
+
+    /** Called only while [eventTransitionMutex] is held. */
+    private suspend fun publishEvent(event: TransportEvent) {
+        beforeEventPublication(event)
+        mutableEvents.emit(event)
+    }
+
+    /** Called only while [eventTransitionMutex] is held. */
+    private suspend fun publishEvents(events: Iterable<TransportEvent>) {
+        events.forEach { publishEvent(it) }
     }
 
     private fun unavailable(
@@ -551,6 +693,12 @@ class BleTransportAdapter internal constructor(
         var identityResolutionActive: Boolean = false,
     )
 
+    private data class IdentityResolutionRequest(
+        val scope: CoroutineScope,
+        val deviceAddress: String,
+        val opportunityId: TransportOpportunityId,
+    )
+
     private sealed interface TransferAuthorization {
         data class Approved(
             val deviceAddress: String,
@@ -576,7 +724,9 @@ class BleTransportAdapter internal constructor(
         val ADAPTER_ID = TransportAdapterId("android-ble-gatt-v1")
         const val DEFAULT_CONTACT_VALIDITY_MS = 15_000L
         const val DEFAULT_EXPIRATION_SWEEP_INTERVAL_MS = 1_000L
-        private const val MAX_ID_COLLISION_RETRIES = 32
+        const val DEFAULT_MAX_ACTIVE_OPPORTUNITIES = 128
+        const val DEFAULT_MAX_CONCURRENT_IDENTITY_RESOLUTIONS = 8
+        private const val EVENT_BUFFER_CAPACITY = 256
     }
 }
 
@@ -663,21 +813,34 @@ internal fun interface BleOpportunityIdGenerator {
 
 internal class SecureRandomBleOpportunityIdGenerator(
     private val random: SecureRandom = SecureRandom(),
+    initialCounter: Long = 1,
 ) : BleOpportunityIdGenerator {
-    override fun nextId(): TransportOpportunityId {
-        val bytes = ByteArray(ENTROPY_BYTES)
-        random.nextBytes(bytes)
-        val hex = CharArray(bytes.size * 2)
-        bytes.forEachIndexed { index, byte ->
+    private val lock = Any()
+    private val instanceNonce = ByteArray(ENTROPY_BYTES).also(random::nextBytes)
+    private var nextCounter = initialCounter
+
+    init {
+        require(initialCounter > 0) { "BLE opportunity counter must be positive" }
+    }
+
+    override fun nextId(): TransportOpportunityId = synchronized(lock) {
+        check(nextCounter > 0) { "BLE opportunity ID counter exhausted" }
+        val counter = nextCounter
+        nextCounter = if (counter == Long.MAX_VALUE) 0 else counter + 1
+
+        val nonceHex = CharArray(instanceNonce.size * 2)
+        instanceNonce.forEachIndexed { index, byte ->
             val value = byte.toInt() and 0xff
-            hex[index * 2] = HEX[value ushr 4]
-            hex[index * 2 + 1] = HEX[value and 0x0f]
+            nonceHex[index * 2] = HEX[value ushr 4]
+            nonceHex[index * 2 + 1] = HEX[value and 0x0f]
         }
-        return TransportOpportunityId("ble-${hex.concatToString()}")
+        val counterHex = counter.toString(radix = 16).padStart(COUNTER_HEX_CHARS, '0')
+        TransportOpportunityId("ble-${nonceHex.concatToString()}-$counterHex")
     }
 
     private companion object {
         const val ENTROPY_BYTES = 32
+        const val COUNTER_HEX_CHARS = 16
         val HEX = "0123456789abcdef".toCharArray()
     }
 }

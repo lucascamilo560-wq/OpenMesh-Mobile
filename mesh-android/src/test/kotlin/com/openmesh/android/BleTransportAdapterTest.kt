@@ -14,7 +14,12 @@ import com.openmesh.core.TransportTransferId
 import com.openmesh.core.TransportTransferRequest
 import com.openmesh.core.TransportTransferResult
 import java.util.ArrayDeque
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -360,27 +365,251 @@ class BleTransportAdapterTest {
         }
 
     @Test
-    fun `default lifecycle generator uses 256 bits and does not encode BLE or node identity`() {
+    fun `stop teardown is a lifecycle barrier before a new run can start`() = runBlocking {
+        val stopEntered = CountDownLatch(1)
+        val releaseStop = CountDownLatch(1)
+        val platform = FakeBleTransportPlatform().apply {
+            stopScanningBehavior = {
+                stopEntered.countDown()
+                check(releaseStop.await(2, TimeUnit.SECONDS))
+            }
+        }
+        val adapter = adapter(platform = platform, dispatcher = Dispatchers.Default)
+        adapter.start()
+
+        val stopping = async(Dispatchers.Default) { adapter.stop() }
+        assertTrue(stopEntered.await(2, TimeUnit.SECONDS))
+        val restarting = async(Dispatchers.Default) { adapter.start() }
+        delay(25)
+
+        assertFalse(restarting.isCompleted)
+        assertTrue(platform.serverActive)
+        assertTrue(platform.advertiserActive)
+        assertTrue(platform.scannerActive)
+
+        releaseStop.countDown()
+        stopping.await()
+        restarting.await()
+
+        assertTrue(platform.serverActive)
+        assertTrue(platform.advertiserActive)
+        assertTrue(platform.scannerActive)
+        assertEquals(
+            listOf(
+                "server:start",
+                "advertiser:start",
+                "scanner:start",
+                "scanner:stop",
+                "advertiser:stop",
+                "server:stop",
+                "server:start",
+                "advertiser:start",
+                "scanner:start",
+            ),
+            platform.calls.toList(),
+        )
+
+        adapter.stop()
+    }
+
+    @Test
+    fun `event publication preserves scan and unavailable inbound causality`() = runBlocking {
+        val availablePublicationStarted = CompletableDeferred<Unit>()
+        val releaseAvailable = CompletableDeferred<Unit>()
+        val unavailablePublicationStarted = CompletableDeferred<Unit>()
+        val releaseUnavailable = CompletableDeferred<Unit>()
+        val platform = FakeBleTransportPlatform()
+        val clock = FakeBleTransportClock(100)
+        val adapter = adapter(
+            platform = platform,
+            clock = clock,
+            ids = listOf("causal-x"),
+            beforeEventPublication = { event ->
+                when {
+                    event is TransportEvent.OpportunityAvailable &&
+                        availablePublicationStarted.complete(Unit) -> releaseAvailable.await()
+
+                    event is TransportEvent.OpportunityUnavailable &&
+                        unavailablePublicationStarted.complete(Unit) -> releaseUnavailable.await()
+                }
+            },
+        )
+        val events = mutableListOf<TransportEvent>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+            adapter.events.collect(events::add)
+        }
+        adapter.start()
+
+        val firstScan = async(start = CoroutineStart.UNDISPATCHED) {
+            observe(adapter, ADDRESS_A, 100)
+        }
+        availablePublicationStarted.await()
+        val secondScan = async(start = CoroutineStart.UNDISPATCHED) {
+            observe(adapter, ADDRESS_A, 120)
+        }
+        delay(25)
+        assertFalse(secondScan.isCompleted)
+
+        releaseAvailable.complete(Unit)
+        firstScan.await()
+        secondScan.await()
+        awaitEvents(events, 2)
+        val available = events[0] as TransportEvent.OpportunityAvailable
+        val changed = events[1] as TransportEvent.OpportunityChanged
+        assertEquals(available.opportunity.reference, changed.previous)
+
+        clock.now = 220
+        val expiry = async(start = CoroutineStart.UNDISPATCHED) {
+            adapter.expireStaleOpportunities()
+        }
+        unavailablePublicationStarted.await()
+        val inbound = async(start = CoroutineStart.UNDISPATCHED) {
+            platform.emitInbound(ADDRESS_A, byteArrayOf(0x11, 0x22))
+        }
+        delay(25)
+        assertFalse(inbound.isCompleted)
+
+        releaseUnavailable.complete(Unit)
+        expiry.await()
+        inbound.await()
+        awaitEvents(events, 4)
+        assertTrue(events[2] is TransportEvent.OpportunityUnavailable)
+        val inboundEvent = events[3] as TransportEvent.InboundBytes
+        assertNull(inboundEvent.opportunity)
+
+        adapter.stop()
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun `stop waits at the pre-send barrier and no GATT send starts after it returns`() =
+        runBlocking {
+            val beforeSendReached = CompletableDeferred<Unit>()
+            val releaseSend = CompletableDeferred<Unit>()
+            val platform = FakeBleTransportPlatform()
+            val adapter = adapter(
+                platform = platform,
+                ids = listOf("stop-transfer-x"),
+                beforeTransferSend = {
+                    beforeSendReached.complete(Unit)
+                    releaseSend.await()
+                },
+            )
+            val events = mutableListOf<TransportEvent>()
+            val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+                adapter.events.collect(events::add)
+            }
+            adapter.start()
+            observe(adapter, ADDRESS_A, 100)
+            awaitEvents(events, 1)
+            val opportunity = (events.single() as TransportEvent.OpportunityAvailable)
+                .opportunity.reference
+
+            val transfer = async(start = CoroutineStart.UNDISPATCHED) {
+                adapter.transfer(request(opportunity, byteArrayOf(0x41), "stop-barrier"))
+            }
+            beforeSendReached.await()
+            val stopping = async(start = CoroutineStart.UNDISPATCHED) { adapter.stop() }
+            delay(25)
+
+            assertFalse(stopping.isCompleted)
+            assertEquals(0, platform.sent.size)
+
+            releaseSend.complete(Unit)
+            assertTrue(transfer.await() is TransportTransferResult.CompletedLocally)
+            stopping.await()
+            assertEquals(1, platform.sent.size)
+            delay(25)
+            assertEquals(1, platform.sent.size)
+
+            collector.cancelAndJoin()
+        }
+
+    @Test
+    fun `active opportunities and identity work remain explicitly bounded`() = runBlocking {
+        val releaseIdentity = CompletableDeferred<ResolvedPeerIdentity?>()
+        val platform = FakeBleTransportPlatform().apply {
+            identityBehavior = { releaseIdentity.await() }
+        }
+        val clock = FakeBleTransportClock(100)
+        val adapter = adapter(
+            platform = platform,
+            clock = clock,
+            ids = listOf("bounded-a", "bounded-b", "bounded-c"),
+            maxActiveOpportunities = 2,
+            maxConcurrentIdentityResolutions = 1,
+        )
+        val events = mutableListOf<TransportEvent>()
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+            adapter.events.collect(events::add)
+        }
+        adapter.start()
+
+        observe(adapter, ADDRESS_A, 100)
+        observe(adapter, ADDRESS_B, 100)
+        observe(adapter, ADDRESS_UNKNOWN, 100)
+        awaitEvents(events, 2)
+
+        assertEquals(2, events.filterIsInstance<TransportEvent.OpportunityAvailable>().size)
+        assertEquals(1, platform.identityCalls.get())
+        assertEquals(1, platform.maximumConcurrentIdentityCalls.get())
+
+        releaseIdentity.complete(null)
+        awaitCondition { platform.activeIdentityCalls.get() == 0 }
+        clock.now = 110
+        observe(adapter, ADDRESS_B, 110)
+        awaitCondition { platform.identityCalls.get() == 2 }
+        assertEquals(1, platform.maximumConcurrentIdentityCalls.get())
+        assertEquals(2, events.filterIsInstance<TransportEvent.OpportunityAvailable>().size)
+
+        adapter.stop()
+        collector.cancelAndJoin()
+    }
+
+    @Test
+    fun `default lifecycle generator uses bounded monotonic IDs with 256 bit instance entropy`() {
         val generator = SecureRandomBleOpportunityIdGenerator()
         val ids = List(64) { generator.nextId().value }
+        val pattern = Regex("ble-([0-9a-f]{64})-([0-9a-f]{16})")
+        val matches = ids.map { checkNotNull(pattern.matchEntire(it)) }
 
         assertEquals(ids.size, ids.toSet().size)
-        assertTrue(ids.all { it.matches(Regex("ble-[0-9a-f]{64}")) })
+        assertEquals(1, matches.map { it.groupValues[1] }.toSet().size)
+        assertEquals((1L..64L).toList(), matches.map { it.groupValues[2].toLong(16) })
         assertTrue(ids.none { it.contains(ADDRESS_A, ignoreCase = true) })
         assertTrue(ids.none { it.contains("om1-", ignoreCase = true) })
+
+        val exhausted = SecureRandomBleOpportunityIdGenerator(initialCounter = Long.MAX_VALUE)
+        exhausted.nextId()
+        try {
+            exhausted.nextId()
+            throw AssertionError("Expected opportunity counter exhaustion")
+        } catch (_: IllegalStateException) {
+            // Fail-closed overflow is the expected bounded behavior.
+        }
     }
 
     private fun adapter(
         platform: FakeBleTransportPlatform,
         clock: FakeBleTransportClock = FakeBleTransportClock(100),
         ids: List<String> = listOf("default-x", "default-y", "default-z"),
+        dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
+        maxActiveOpportunities: Int = BleTransportAdapter.DEFAULT_MAX_ACTIVE_OPPORTUNITIES,
+        maxConcurrentIdentityResolutions: Int =
+            BleTransportAdapter.DEFAULT_MAX_CONCURRENT_IDENTITY_RESOLUTIONS,
+        beforeEventPublication: suspend (TransportEvent) -> Unit = {},
+        beforeTransferSend: suspend () -> Unit = {},
     ): BleTransportAdapter = BleTransportAdapter(
         platform = platform,
         clock = clock,
         opportunityIdGenerator = SequenceOpportunityIdGenerator(ids),
         contactValidityMs = 100,
         expirationSweepIntervalMs = Long.MAX_VALUE,
-        dispatcher = Dispatchers.Unconfined,
+        dispatcher = dispatcher,
+        maxActiveOpportunities = maxActiveOpportunities,
+        maxConcurrentIdentityResolutions = maxConcurrentIdentityResolutions,
+        beforeEventPublication = beforeEventPublication,
+        beforeTransferSend = beforeTransferSend,
     )
 
     private fun request(
@@ -431,6 +660,12 @@ class BleTransportAdapterTest {
         }
     }
 
+    private suspend fun awaitCondition(predicate: () -> Boolean) {
+        withTimeout(1_000) {
+            while (!predicate()) delay(1)
+        }
+    }
+
     private fun resolvedIdentity(seed: Int): ResolvedPeerIdentity = ResolvedPeerIdentity(
         nodeId = MeshNodeId.fromDigest(
             ByteArray(MeshNodeId.DIGEST_BYTES) { index -> (index + seed).toByte() },
@@ -469,52 +704,89 @@ class BleTransportAdapterTest {
         private val advertiserStartSucceeds: Boolean = true,
         private val scannerStartSucceeds: Boolean = true,
     ) : BleTransportPlatform {
-        val calls = mutableListOf<String>()
-        val sent = mutableListOf<Pair<String, ByteArray>>()
+        val calls = Collections.synchronizedList(mutableListOf<String>())
+        val sent = Collections.synchronizedList(mutableListOf<Pair<String, ByteArray>>())
+        val identityCalls = AtomicInteger(0)
+        val activeIdentityCalls = AtomicInteger(0)
+        val maximumConcurrentIdentityCalls = AtomicInteger(0)
 
         var identityBehavior: suspend (String) -> ResolvedPeerIdentity? = { null }
         var sendBehavior: suspend (String, ByteArray) -> BleGattSendResult = { _, _ ->
             BleGattSendResult.Success(frameCount = 1)
         }
+        var stopScanningBehavior: () -> Unit = {}
 
+        @Volatile
+        var serverActive: Boolean = false
+
+        @Volatile
+        var advertiserActive: Boolean = false
+
+        @Volatile
+        var scannerActive: Boolean = false
+
+        @Volatile
         private var inboundCallback: (suspend (String, ByteArray) -> Unit)? = null
+
+        @Volatile
         private var scanCallback: ((PeerAdvertisement) -> Unit)? = null
 
         override fun startServer(
             onBytes: suspend (deviceAddress: String, bytes: ByteArray) -> Unit,
         ): Boolean {
             calls += "server:start"
-            if (serverStartSucceeds) inboundCallback = onBytes
+            if (serverStartSucceeds) {
+                inboundCallback = onBytes
+                serverActive = true
+            }
             return serverStartSucceeds
         }
 
         override fun startAdvertising(): Boolean {
             calls += "advertiser:start"
+            if (advertiserStartSucceeds) advertiserActive = true
             return advertiserStartSucceeds
         }
 
         override fun startScanning(onAdvertisement: (PeerAdvertisement) -> Unit): Boolean {
             calls += "scanner:start"
-            if (scannerStartSucceeds) scanCallback = onAdvertisement
+            if (scannerStartSucceeds) {
+                scanCallback = onAdvertisement
+                scannerActive = true
+            }
             return scannerStartSucceeds
         }
 
         override fun stopScanning() {
             calls += "scanner:stop"
+            stopScanningBehavior()
+            scannerActive = false
             scanCallback = null
         }
 
         override fun stopAdvertising() {
             calls += "advertiser:stop"
+            advertiserActive = false
         }
 
         override fun stopServer() {
             calls += "server:stop"
+            serverActive = false
             inboundCallback = null
         }
 
-        override suspend fun resolveIdentity(deviceAddress: String): ResolvedPeerIdentity? =
-            identityBehavior(deviceAddress)
+        override suspend fun resolveIdentity(deviceAddress: String): ResolvedPeerIdentity? {
+            identityCalls.incrementAndGet()
+            val active = activeIdentityCalls.incrementAndGet()
+            maximumConcurrentIdentityCalls.accumulateAndGet(active) { previous, current ->
+                maxOf(previous, current)
+            }
+            return try {
+                identityBehavior(deviceAddress)
+            } finally {
+                activeIdentityCalls.decrementAndGet()
+            }
+        }
 
         override suspend fun sendBytes(
             deviceAddress: String,
