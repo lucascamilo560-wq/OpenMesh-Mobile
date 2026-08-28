@@ -3,6 +3,7 @@ package com.openmesh.core
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -66,6 +67,39 @@ class PersistentTransportDecisionExecutorTest {
         assertTrue(busy is TransferReservationResult.Busy)
         assertTrue(differentRevision is TransferReservationResult.Acquired)
         assertEquals(2, store.snapshot(deliveryId).transferAttempts.size)
+    }
+
+    @Test
+    fun `decision subject mismatch cannot execute another delivery`() = runBlocking {
+        val store = InMemoryDeliveryStore()
+        val deliveryA = deliveryObject("subject-delivery-a")
+        val deliveryB = deliveryObject("subject-delivery-b")
+        store.ingest(ingest(deliveryA), nowMs = 100)
+        store.ingest(ingest(deliveryB), nowMs = 100)
+        val tracking = TrackingDeliveryStore(store)
+        val adapter = RecordingAdapter()
+        val executor = executor(tracking, adapter)
+        val bindingA = DeliveryTransportDecisionBinding.bind(deliveryA.deliveryId, SUBJECT_ID)
+        val bindingB = DeliveryTransportDecisionBinding.bind(
+            deliveryB.deliveryId,
+            TransportDecisionSubjectId("different-subject"),
+        )
+
+        val mismatch = executor.execute(bindingB, transferDecision())
+
+        assertTrue(mismatch is PersistentTransportExecutionResult.SubjectMismatch)
+        assertEquals(0, tracking.mutationCalls)
+        assertEquals(0, adapter.calls)
+        assertTrue(store.snapshot(deliveryB.deliveryId).transferAttempts.isEmpty())
+
+        val matching = executor.execute(bindingA, transferDecision())
+
+        assertTrue(matching is PersistentTransportExecutionResult.LinkWriteCompleted)
+        assertEquals(1, adapter.calls)
+        assertEquals(
+            TransferAttemptState.LINK_WRITE_COMPLETED,
+            store.snapshot(deliveryA.deliveryId).transferAttempts.single().state,
+        )
     }
 
     @Test
@@ -321,6 +355,83 @@ class PersistentTransportDecisionExecutorTest {
     }
 
     @Test
+    fun `execution deadline settles failed before lease expiry`() = runBlocking {
+        val store = waitingStore("executor-deadline")
+        val entered = CompletableDeferred<Unit>()
+        val adapter = RecordingAdapter { _ ->
+            entered.complete(Unit)
+            awaitCancellation()
+        }
+        val executor = executor(
+            store = store,
+            adapters = TransportAdapterSet.copyOf(listOf(adapter)),
+            leaseDurationMs = 1_000,
+            executionTimeoutMs = 25,
+            settlementMarginMs = 100,
+        )
+
+        val result = executor.execute(
+            DeliveryId("executor-deadline"),
+            transferDecision(),
+        ) as PersistentTransportExecutionResult.Failed
+        entered.await()
+
+        assertEquals(PersistentTransportFailureReason.EXECUTION_TIMED_OUT, result.failureReason)
+        assertSame(PersistentLocalTransportOutcome.ExecutionTimedOut, result.localOutcome)
+        assertEquals(TransferAttemptState.FAILED, result.attempt.state)
+        assertTrue(result.attempt.finishedAtMs!! < result.attempt.leaseExpiresAtMs)
+        assertNull(result.attempt.linkWriteCompletedAtMs)
+        assertEquals(1, adapter.calls)
+    }
+
+    @Test
+    fun `thirty second transport timeout settles inside configured lease margin`() = runBlocking {
+        val store = waitingStore("executor-thirty-second-timeout")
+        val adapter = RecordingAdapter { request ->
+            TransportTransferResult.FailedLocally(
+                transferId = request.transferId,
+                occurredAtMs = 30_110,
+                failure = TransportLocalFailure(TransportLocalFailureCode.TIMED_OUT),
+            )
+        }
+        val executor = executor(
+            store = store,
+            adapters = TransportAdapterSet.copyOf(listOf(adapter)),
+            clock = SequenceClock(110, 111, 112, 30_111),
+            leaseDurationMs = 40_000,
+            executionTimeoutMs = 30_000,
+            settlementMarginMs = 5_000,
+        )
+
+        val result = executor.execute(
+            DeliveryId("executor-thirty-second-timeout"),
+            transferDecision(),
+        ) as PersistentTransportExecutionResult.Failed
+
+        assertEquals(PersistentTransportFailureReason.TRANSPORT_LOCAL_TIMED_OUT, result.failureReason)
+        assertEquals(TransferAttemptState.FAILED, result.attempt.state)
+        assertEquals(30_111L, result.attempt.finishedAtMs)
+        assertTrue(result.attempt.finishedAtMs!! < result.attempt.leaseExpiresAtMs)
+    }
+
+    @Test
+    fun `execution deadline and settlement margin must fit strictly inside lease`() {
+        expectThrows<IllegalArgumentException> {
+            PersistentTransportDecisionExecutor(
+                deliveryStore = InMemoryDeliveryStore(),
+                adapters = TransportAdapterSet.Empty,
+                clock = IncrementingClock(),
+                transferIdGenerator = PersistentTransportTransferIdGenerator {
+                    TransportTransferId("invalid-deadline-correlation")
+                },
+                leaseDurationMs = 35_000,
+                executionTimeoutMs = 30_000,
+                settlementMarginMs = 5_000,
+            )
+        }
+    }
+
+    @Test
     fun `store failure before IO prevents adapter call`() = runBlocking {
         val backing = waitingStore("executor-before-io")
         val tracking = TrackingDeliveryStore(backing).apply { failStart = true }
@@ -452,19 +563,41 @@ class PersistentTransportDecisionExecutorTest {
     private fun executor(
         store: DeliveryStore,
         adapters: TransportAdapterSet,
+        clock: PersistentTransportExecutionClock = IncrementingClock(),
+        leaseDurationMs: Long = 1_000,
+        executionTimeoutMs: Long = 100,
+        settlementMarginMs: Long = 100,
     ): PersistentTransportDecisionExecutor = PersistentTransportDecisionExecutor(
         deliveryStore = store,
         adapters = adapters,
-        clock = IncrementingClock(),
+        clock = clock,
         transferIdGenerator = PersistentTransportTransferIdGenerator {
             TransportTransferId("bounded-local-correlation")
         },
-        leaseDurationMs = 1_000,
+        leaseDurationMs = leaseDurationMs,
+        executionTimeoutMs = executionTimeoutMs,
+        settlementMarginMs = settlementMarginMs,
+    )
+
+    private suspend fun PersistentTransportDecisionExecutor.execute(
+        deliveryId: DeliveryId,
+        decision: TransportDecision,
+    ): PersistentTransportExecutionResult = execute(
+        DeliveryTransportDecisionBinding.bind(deliveryId, SUBJECT_ID),
+        decision,
     )
 
     private class IncrementingClock(private var now: Long = 110) :
         PersistentTransportExecutionClock {
         override fun nowMs(): Long = now++
+    }
+
+    private class SequenceClock(vararg values: Long) : PersistentTransportExecutionClock {
+        private val remaining = ArrayDeque(values.toList())
+
+        override fun nowMs(): Long = checkNotNull(remaining.removeFirstOrNull()) {
+            "No timestamp remains in the deterministic clock"
+        }
     }
 
     private class RecordingAdapter(
