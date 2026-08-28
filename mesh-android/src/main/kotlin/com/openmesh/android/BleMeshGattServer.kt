@@ -22,13 +22,26 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
-/** Receives OpenMesh envelopes and exposes self-certifying peer identity over BLE GATT. */
-class BleMeshGattServer(
+/** Receives framed bytes and exposes self-certifying peer identity over BLE GATT. */
+class BleMeshGattServer private constructor(
     context: Context,
     private val localNodeId: String,
     private val localIdentity: MeshKeyPair? = null,
-    private val onEnvelope: suspend (MeshEnvelope) -> Unit,
+    private val inboundHandler: BleGattReassembledHandler,
 ) {
+    /** Legacy v1 wrapper: decode remains synchronous before the GATT response. */
+    constructor(
+        context: Context,
+        localNodeId: String,
+        localIdentity: MeshKeyPair? = null,
+        onEnvelope: suspend (MeshEnvelope) -> Unit,
+    ) : this(
+        context = context,
+        localNodeId = localNodeId,
+        localIdentity = localIdentity,
+        inboundHandler = legacyBleGattInboundHandler(onEnvelope),
+    )
+
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val assembler = BleFrameAssembler()
@@ -117,8 +130,8 @@ class BleMeshGattServer(
 
             val accepted = runCatching {
                 assembler.accept(value)?.let { completed ->
-                    val envelope = MeshEnvelopeCodec.decode(completed)
-                    scope.launch { onEnvelope(envelope) }
+                    val delivery = inboundHandler.prepare(device.address, completed)
+                    scope.launch { delivery() }
                 }
                 true
             }.getOrDefault(false)
@@ -220,4 +233,42 @@ class BleMeshGattServer(
             server?.sendResponse(device, requestId, status, offset, value)
         }
     }
+
+    companion object {
+        internal fun forOpaqueBytes(
+            context: Context,
+            localNodeId: String,
+            localIdentity: MeshKeyPair? = null,
+            onBytes: suspend (deviceAddress: String, bytes: ByteArray) -> Unit,
+        ): BleMeshGattServer = BleMeshGattServer(
+            context = context,
+            localNodeId = localNodeId,
+            localIdentity = localIdentity,
+            inboundHandler = opaqueBleGattInboundHandler(onBytes),
+        )
+    }
+}
+
+/**
+ * Prepares a completed reassembly synchronously, then performs delivery later.
+ * This preserves legacy fail-fast decode while allowing an opaque raw path.
+ */
+internal fun interface BleGattReassembledHandler {
+    fun prepare(deviceAddress: String, bytes: ByteArray): suspend () -> Unit
+}
+
+internal fun legacyBleGattInboundHandler(
+    onEnvelope: suspend (MeshEnvelope) -> Unit,
+): BleGattReassembledHandler = BleGattReassembledHandler { _, bytes ->
+    val envelope = MeshEnvelopeCodec.decode(bytes)
+    val delivery: suspend () -> Unit = { onEnvelope(envelope) }
+    delivery
+}
+
+internal fun opaqueBleGattInboundHandler(
+    onBytes: suspend (deviceAddress: String, bytes: ByteArray) -> Unit,
+): BleGattReassembledHandler = BleGattReassembledHandler { deviceAddress, bytes ->
+    val immutableBytes = bytes.copyOf()
+    val delivery: suspend () -> Unit = { onBytes(deviceAddress, immutableBytes) }
+    delivery
 }

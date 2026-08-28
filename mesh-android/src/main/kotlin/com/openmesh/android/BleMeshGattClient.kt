@@ -16,7 +16,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Sends one OpenMesh envelope to one nearby BLE peer.
+ * Sends opaque bytes to one nearby BLE peer, with a compatibility wrapper for
+ * the legacy v1 [MeshEnvelope] path.
  *
  * For the first real-device transport path we deliberately use the default ATT
  * MTU (23) instead of immediately negotiating a larger MTU. This creates more
@@ -32,16 +33,45 @@ class BleMeshGattClient(
         deviceAddress: String,
         envelope: MeshEnvelope,
         timeoutMs: Long = 30_000,
+    ): BleGattSendResult = sendBytes(
+        deviceAddress = deviceAddress,
+        opaqueBytes = encodeLegacyBleGattPayload(envelope),
+        timeoutMs = timeoutMs,
+    )
+
+    /** Frames and writes bytes without interpreting the transported protocol. */
+    @SuppressLint("MissingPermission")
+    suspend fun sendBytes(
+        deviceAddress: String,
+        opaqueBytes: ByteArray,
+        timeoutMs: Long = 30_000,
     ): BleGattSendResult {
         val manager = appContext.getSystemService(BluetoothManager::class.java)
-            ?: return BleGattSendResult.Failed(BleGattStage.CONNECT, detail = "BluetoothManager unavailable")
+            ?: return BleGattSendResult.Failed(
+                stage = BleGattStage.CONNECT,
+                kind = BleGattFailureKind.UNSUPPORTED,
+                detail = "BluetoothManager unavailable",
+            )
         val adapter = manager.adapter
-            ?: return BleGattSendResult.Failed(BleGattStage.CONNECT, detail = "BluetoothAdapter unavailable")
-        val device = runCatching { adapter.getRemoteDevice(deviceAddress) }.getOrNull()
-            ?: return BleGattSendResult.Failed(BleGattStage.CONNECT, detail = "Invalid/stale device address")
+            ?: return BleGattSendResult.Failed(
+                stage = BleGattStage.CONNECT,
+                kind = BleGattFailureKind.UNSUPPORTED,
+                detail = "BluetoothAdapter unavailable",
+            )
+        val deviceLookup = runCatching { adapter.getRemoteDevice(deviceAddress) }
+        val device = deviceLookup.getOrNull()
+            ?: return BleGattSendResult.Failed(
+                stage = BleGattStage.CONNECT,
+                kind = if (deviceLookup.exceptionOrNull() is SecurityException) {
+                    BleGattFailureKind.PERMISSION_DENIED
+                } else {
+                    BleGattFailureKind.INVALID_REQUEST
+                },
+                detail = "Invalid/stale device address",
+            )
 
         val completion = CompletableDeferred<BleGattSendResult>()
-        val encodedEnvelope = MeshEnvelopeCodec.encode(envelope)
+        val payload = opaqueBytes.copyOf()
 
         var gatt: BluetoothGatt? = null
         var rx: BluetoothGattCharacteristic? = null
@@ -60,11 +90,17 @@ class BleMeshGattClient(
             stage = BleGattStage.PREPARE_FRAMES
             val attPayload = (DEFAULT_MTU - 3).coerceAtLeast(BleFrameCodec.HEADER_SIZE + 1)
             return runCatching {
-                frames = BleFrameCodec.chunk(encodedEnvelope, attPayload)
+                frames = BleFrameCodec.chunk(payload, attPayload)
                 nextFrameIndex = 0
                 true
             }.getOrElse { error ->
-                finish(BleGattSendResult.Failed(stage, detail = error.message))
+                finish(
+                    BleGattSendResult.Failed(
+                        stage = stage,
+                        kind = BleGattFailureKind.RESOURCE_LIMIT,
+                        detail = error.message,
+                    )
+                )
                 false
             }
         }
@@ -201,21 +237,31 @@ class BleMeshGattClient(
         }
 
         stage = BleGattStage.CONNECT
-        gatt = runCatching {
+        val connection = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 device.connectGatt(appContext, false, callback, BluetoothDevice.TRANSPORT_LE)
             } else {
                 @Suppress("DEPRECATION")
                 device.connectGatt(appContext, false, callback)
             }
-        }.getOrNull() ?: return BleGattSendResult.Failed(
+        }
+        gatt = connection.getOrNull() ?: return BleGattSendResult.Failed(
             stage = BleGattStage.CONNECT,
+            kind = if (connection.exceptionOrNull() is SecurityException) {
+                BleGattFailureKind.PERMISSION_DENIED
+            } else {
+                BleGattFailureKind.IO_ERROR
+            },
             detail = "connectGatt threw/returned null",
         )
 
         return try {
             withTimeoutOrNull(timeoutMs) { completion.await() }
-                ?: BleGattSendResult.Failed(stage = stage, detail = "timeout ${timeoutMs}ms")
+                ?: BleGattSendResult.Failed(
+                    stage = stage,
+                    kind = BleGattFailureKind.TIMED_OUT,
+                    detail = "timeout ${timeoutMs}ms",
+                )
         } finally {
             runCatching { gatt?.disconnect() }
             runCatching { gatt?.close() }
@@ -245,5 +291,20 @@ sealed interface BleGattSendResult {
         val frameIndex: Int? = null,
         val frameCount: Int? = null,
         val detail: String? = null,
+        val kind: BleGattFailureKind = BleGattFailureKind.IO_ERROR,
     ) : BleGattSendResult
 }
+
+enum class BleGattFailureKind {
+    PERMISSION_DENIED,
+    TIMED_OUT,
+    IO_ERROR,
+    RESOURCE_LIMIT,
+    UNSUPPORTED,
+    INVALID_REQUEST,
+    UNKNOWN,
+}
+
+/** Compatibility seam kept byte-exact with the v1 wire codec. */
+internal fun encodeLegacyBleGattPayload(envelope: MeshEnvelope): ByteArray =
+    MeshEnvelopeCodec.encode(envelope)
