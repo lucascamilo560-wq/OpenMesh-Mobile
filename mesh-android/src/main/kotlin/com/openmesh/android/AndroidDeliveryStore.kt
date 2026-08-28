@@ -1046,7 +1046,11 @@ private fun Cursor.toLoadedAttempt(): LoadedAttempt = LoadedAttempt(
     attempt = TransferAttempt(
         attemptId = TransferAttemptId(string("attempt_id")),
         deliveryId = DeliveryId(string("delivery_id")),
-        context = TransferContext(string("adapter_id"), string("opportunity_id")),
+        context = TransferContext(
+            adapterId = string("adapter_id"),
+            opportunityId = string("opportunity_id"),
+            opportunityRevision = nullableLong("opportunity_revision"),
+        ),
         state = enumValueOf(string("state")),
         reservedAtMs = long("reserved_at_ms"),
         leaseExpiresAtMs = long("lease_expires_at_ms"),
@@ -1372,6 +1376,7 @@ private fun attemptValues(attempt: TransferAttempt, ownerToken: String): Content
         put("delivery_id", attempt.deliveryId.value)
         put("adapter_id", attempt.context.adapterId)
         put("opportunity_id", attempt.context.opportunityId)
+        putNullable("opportunity_revision", attempt.context.opportunityRevision)
         put("state", attempt.state.name)
         put("reserved_at_ms", attempt.reservedAtMs)
         put("lease_expires_at_ms", attempt.leaseExpiresAtMs)
