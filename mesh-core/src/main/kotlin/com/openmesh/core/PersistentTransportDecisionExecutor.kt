@@ -4,6 +4,7 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 fun interface PersistentTransportExecutionClock {
     fun nowMs(): Long
@@ -27,6 +28,7 @@ enum class PersistentTransportFailureReason {
     ADAPTER_CONTRACT_TRANSFER_ID_MISMATCH,
     ADAPTER_CONTRACT_OPPORTUNITY_MISMATCH,
     ADAPTER_EXCEPTION,
+    EXECUTION_TIMED_OUT,
     EXECUTION_CANCELLED,
 }
 
@@ -42,7 +44,29 @@ sealed interface PersistentLocalTransportOutcome {
     ) : PersistentLocalTransportOutcome
 
     data object AdapterThrew : PersistentLocalTransportOutcome
+    data object ExecutionTimedOut : PersistentLocalTransportOutcome
     data object Cancelled : PersistentLocalTransportOutcome
+}
+
+/**
+ * Local capability binding one policy/decision subject to one delivery object.
+ *
+ * The association is created before decision evaluation and is never inferred
+ * by the executor from either side independently.
+ */
+class DeliveryTransportDecisionBinding private constructor(
+    val deliveryId: DeliveryId,
+    val subjectId: TransportDecisionSubjectId,
+) {
+    companion object {
+        fun bind(
+            deliveryId: DeliveryId,
+            subjectId: TransportDecisionSubjectId,
+        ): DeliveryTransportDecisionBinding = DeliveryTransportDecisionBinding(
+            deliveryId = deliveryId,
+            subjectId = subjectId,
+        )
+    }
 }
 
 /** Result of one decision execution. None of these variants is delivery evidence. */
@@ -55,6 +79,12 @@ sealed interface PersistentTransportExecutionResult {
         override val registrySequence: OpportunityRegistrySequence
             get() = decision.registrySequence
     }
+
+    data class SubjectMismatch(
+        override val registrySequence: OpportunityRegistrySequence,
+        val bindingSubjectId: TransportDecisionSubjectId,
+        val decisionSubjectId: TransportDecisionSubjectId,
+    ) : PersistentTransportExecutionResult
 
     data class AdapterUnavailable(
         override val registrySequence: OpportunityRegistrySequence,
@@ -127,11 +157,25 @@ class PersistentTransportDecisionExecutor(
     private val clock: PersistentTransportExecutionClock,
     private val transferIdGenerator: PersistentTransportTransferIdGenerator,
     private val leaseDurationMs: Long = DEFAULT_LEASE_DURATION_MS,
+    private val executionTimeoutMs: Long = DEFAULT_EXECUTION_TIMEOUT_MS,
+    private val settlementMarginMs: Long = DEFAULT_SETTLEMENT_MARGIN_MS,
 ) {
     init {
         require(leaseDurationMs > 0) { "Transport execution lease must be positive" }
         require(leaseDurationMs <= MAX_LEASE_DURATION_MS) {
             "Transport execution lease exceeds $MAX_LEASE_DURATION_MS ms"
+        }
+        require(executionTimeoutMs > 0) {
+            "Transport execution timeout must be positive"
+        }
+        require(settlementMarginMs > 0) {
+            "Transport execution settlement margin must be positive"
+        }
+        require(settlementMarginMs < leaseDurationMs) {
+            "Transport execution settlement margin must be shorter than the lease"
+        }
+        require(executionTimeoutMs < leaseDurationMs - settlementMarginMs) {
+            "Transport execution timeout plus settlement margin must be shorter than the lease"
         }
     }
 
@@ -139,6 +183,8 @@ class PersistentTransportDecisionExecutor(
         deliveryStore: DeliveryStore,
         adapters: TransportAdapterSet,
         leaseDurationMs: Long = DEFAULT_LEASE_DURATION_MS,
+        executionTimeoutMs: Long = DEFAULT_EXECUTION_TIMEOUT_MS,
+        settlementMarginMs: Long = DEFAULT_SETTLEMENT_MARGIN_MS,
     ) : this(
         deliveryStore = deliveryStore,
         adapters = adapters,
@@ -147,12 +193,21 @@ class PersistentTransportDecisionExecutor(
             TransportTransferId("transport-${UUID.randomUUID()}")
         },
         leaseDurationMs = leaseDurationMs,
+        executionTimeoutMs = executionTimeoutMs,
+        settlementMarginMs = settlementMarginMs,
     )
 
     suspend fun execute(
-        deliveryId: DeliveryId,
+        binding: DeliveryTransportDecisionBinding,
         decision: TransportDecision,
     ): PersistentTransportExecutionResult {
+        if (decision.subjectId != binding.subjectId) {
+            return PersistentTransportExecutionResult.SubjectMismatch(
+                registrySequence = decision.registrySequence,
+                bindingSubjectId = binding.subjectId,
+                decisionSubjectId = decision.subjectId,
+            )
+        }
         if (decision is TransportDecision.Wait) {
             return PersistentTransportExecutionResult.Wait(decision)
         }
@@ -164,10 +219,10 @@ class PersistentTransportDecisionExecutor(
                 adapterId = decision.opportunity.adapterId,
             )
 
-        val deliveryObject = deliveryStore.snapshot(deliveryId).deliveryObject
+        val deliveryObject = deliveryStore.snapshot(binding.deliveryId).deliveryObject
             ?: return PersistentTransportExecutionResult.DeliveryObjectUnavailable(
                 registrySequence = decision.registrySequence,
-                deliveryId = deliveryId,
+                deliveryId = binding.deliveryId,
             )
         val canonicalBytes = deliveryObject.canonicalBytes.copyToByteArray()
         if (
@@ -188,7 +243,7 @@ class PersistentTransportDecisionExecutor(
         )
         val reservation = deliveryStore.reserveTransfer(
             reservation = TransferReservation(
-                deliveryId = deliveryId,
+                deliveryId = binding.deliveryId,
                 context = TransferContext.forOpportunity(decision.opportunity),
                 leaseDurationMs = leaseDurationMs,
             ),
@@ -212,8 +267,28 @@ class PersistentTransportDecisionExecutor(
 
         deliveryStore.markTransferStarted(reservation.lease, nowMs())
 
-        val adapterResult = try {
-            adapter.transfer(request)
+        val beforeAdapterMs = nowMs()
+        val latestAdapterCompletionMs = reservation.lease.expiresAtMs - settlementMarginMs
+        val leaseBoundExecutionTimeoutMs = latestAdapterCompletionMs - beforeAdapterMs
+        if (leaseBoundExecutionTimeoutMs <= 0) {
+            val outcome = PersistentLocalTransportOutcome.ExecutionTimedOut
+            val reason = PersistentTransportFailureReason.EXECUTION_TIMED_OUT
+            return PersistentTransportExecutionResult.Failed(
+                registrySequence = decision.registrySequence,
+                attempt = settleFailure(reservation.lease, reason, outcome),
+                failureReason = reason,
+                localOutcome = outcome,
+            )
+        }
+        val effectiveExecutionTimeoutMs = minOf(
+            executionTimeoutMs,
+            leaseBoundExecutionTimeoutMs,
+        )
+
+        val completedCall = try {
+            withTimeoutOrNull(effectiveExecutionTimeoutMs) {
+                CompletedAdapterCall(adapter.transfer(request))
+            }
         } catch (cancelled: CancellationException) {
             try {
                 withContext(NonCancellable) {
@@ -241,6 +316,17 @@ class PersistentTransportDecisionExecutor(
             }
             throw TransportAdapterExecutionException(reservation.attempt.attemptId, failure)
         }
+        if (completedCall == null) {
+            val outcome = PersistentLocalTransportOutcome.ExecutionTimedOut
+            val reason = PersistentTransportFailureReason.EXECUTION_TIMED_OUT
+            return PersistentTransportExecutionResult.Failed(
+                registrySequence = decision.registrySequence,
+                attempt = settleFailure(reservation.lease, reason, outcome),
+                failureReason = reason,
+                localOutcome = outcome,
+            )
+        }
+        val adapterResult = completedCall.result
 
         val transferIdMismatch = adapterResult.transferId != request.transferId
         if (transferIdMismatch) {
@@ -340,10 +426,16 @@ class PersistentTransportDecisionExecutor(
     }
 
     companion object {
-        const val DEFAULT_LEASE_DURATION_MS = 30_000L
+        const val DEFAULT_LEASE_DURATION_MS = 40_000L
+        const val DEFAULT_EXECUTION_TIMEOUT_MS = 30_000L
+        const val DEFAULT_SETTLEMENT_MARGIN_MS = 5_000L
         const val MAX_LEASE_DURATION_MS = 7L * 24L * 60L * 60L * 1_000L
     }
 }
+
+private data class CompletedAdapterCall(
+    val result: TransportTransferResult,
+)
 
 private fun TransportLocalFailureCode.toPersistentReason(): PersistentTransportFailureReason =
     when (this) {
