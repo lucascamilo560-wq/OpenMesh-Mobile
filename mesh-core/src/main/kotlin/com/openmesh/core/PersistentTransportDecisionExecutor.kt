@@ -2,9 +2,13 @@ package com.openmesh.core
 
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 fun interface PersistentTransportExecutionClock {
     fun nowMs(): Long
@@ -285,9 +289,9 @@ class PersistentTransportDecisionExecutor(
             leaseBoundExecutionTimeoutMs,
         )
 
-        val completedCall = try {
-            withTimeoutOrNull(effectiveExecutionTimeoutMs) {
-                CompletedAdapterCall(adapter.transfer(request))
+        val deadlineCall = try {
+            executeBeforeDeadline(effectiveExecutionTimeoutMs) {
+                adapter.transfer(request)
             }
         } catch (cancelled: CancellationException) {
             try {
@@ -316,7 +320,7 @@ class PersistentTransportDecisionExecutor(
             }
             throw TransportAdapterExecutionException(reservation.attempt.attemptId, failure)
         }
-        if (completedCall == null) {
+        if (deadlineCall is AdapterDeadlineCall.TimedOut) {
             val outcome = PersistentLocalTransportOutcome.ExecutionTimedOut
             val reason = PersistentTransportFailureReason.EXECUTION_TIMED_OUT
             return PersistentTransportExecutionResult.Failed(
@@ -326,7 +330,8 @@ class PersistentTransportDecisionExecutor(
                 localOutcome = outcome,
             )
         }
-        val adapterResult = completedCall.result
+        deadlineCall as AdapterDeadlineCall.Completed
+        val adapterResult = deadlineCall.result
 
         val transferIdMismatch = adapterResult.transferId != request.transferId
         if (transferIdMismatch) {
@@ -425,6 +430,29 @@ class PersistentTransportDecisionExecutor(
         require(it >= 0) { "Transport execution clock returned a negative timestamp" }
     }
 
+    private suspend fun executeBeforeDeadline(
+        timeoutMs: Long,
+        transfer: suspend () -> TransportTransferResult,
+    ): AdapterDeadlineCall = coroutineScope {
+        val operation = async(start = CoroutineStart.UNDISPATCHED) { transfer() }
+        val timeout = async {
+            delay(timeoutMs)
+            Unit
+        }
+        try {
+            select {
+                operation.onAwait { AdapterDeadlineCall.Completed(it) }
+                timeout.onAwait {
+                    operation.cancel()
+                    AdapterDeadlineCall.TimedOut
+                }
+            }
+        } finally {
+            timeout.cancel()
+            if (!operation.isCompleted) operation.cancel()
+        }
+    }
+
     companion object {
         const val DEFAULT_LEASE_DURATION_MS = 40_000L
         const val DEFAULT_EXECUTION_TIMEOUT_MS = 30_000L
@@ -433,9 +461,10 @@ class PersistentTransportDecisionExecutor(
     }
 }
 
-private data class CompletedAdapterCall(
-    val result: TransportTransferResult,
-)
+private sealed interface AdapterDeadlineCall {
+    data class Completed(val result: TransportTransferResult) : AdapterDeadlineCall
+    data object TimedOut : AdapterDeadlineCall
+}
 
 private fun TransportLocalFailureCode.toPersistentReason(): PersistentTransportFailureReason =
     when (this) {
