@@ -28,6 +28,11 @@ import com.openmesh.core.TombstoneReason
 import com.openmesh.core.TransferAttemptId
 import com.openmesh.core.TransferAttemptState
 import com.openmesh.core.TransferContext
+import com.openmesh.core.TransportAdapterId
+import com.openmesh.core.TransportOpportunityId
+import com.openmesh.core.TransportOpportunityKey
+import com.openmesh.core.TransportOpportunityReference
+import com.openmesh.core.TransportOpportunityRevision
 import com.openmesh.core.TransferReservation
 import com.openmesh.core.TransferReservationResult
 import com.openmesh.core.VerifiedNextHopAcceptance
@@ -281,6 +286,52 @@ class AndroidDeliveryStoreTest {
                 recovered.markTransferStarted(first.lease, nowMs = 121)
             }
             recovered.close()
+        }
+
+    @Test
+    fun `revisioned contexts persist exactly and are busy only for the same binding`() =
+        runBlocking {
+            val name = databaseName()
+            val store = AndroidDeliveryStore(context, name)
+            val delivery = deliveryObject("sqlite-revisioned-context")
+            store.ingest(ingest(delivery), nowMs = 100)
+            val key = TransportOpportunityKey(
+                TransportAdapterId("sqlite-test-adapter"),
+                TransportOpportunityId("sqlite-test-opportunity"),
+            )
+            val revisionOne = TransferContext.forOpportunity(
+                TransportOpportunityReference(key, TransportOpportunityRevision(1)),
+            )
+            val revisionTwo = TransferContext.forOpportunity(
+                TransportOpportunityReference(key, TransportOpportunityRevision(2)),
+            )
+
+            val first = store.reserveTransfer(
+                TransferReservation(delivery.deliveryId, revisionOne, 1_000),
+                nowMs = 110,
+            )
+            val busy = store.reserveTransfer(
+                TransferReservation(delivery.deliveryId, revisionOne, 1_000),
+                nowMs = 111,
+            )
+            val second = store.reserveTransfer(
+                TransferReservation(delivery.deliveryId, revisionTwo, 1_000),
+                nowMs = 112,
+            )
+
+            assertTrue(first is TransferReservationResult.Acquired)
+            assertTrue(busy is TransferReservationResult.Busy)
+            assertTrue(second is TransferReservationResult.Acquired)
+            store.close()
+
+            val reopened = AndroidDeliveryStore(context, name)
+            assertEquals(
+                setOf(revisionOne, revisionTwo),
+                reopened.snapshot(delivery.deliveryId).transferAttempts.mapTo(mutableSetOf()) {
+                    it.context
+                },
+            )
+            reopened.close()
         }
 
     @Test
@@ -579,6 +630,16 @@ class AndroidDeliveryStoreTest {
         }
         assertTrue("local_node_id" in migrationColumns)
         assertTrue("disposition" in importItemColumns)
+        val attemptColumns = database.rawQuery(
+            "PRAGMA table_info(transfer_attempts)",
+            null,
+        ).use { cursor ->
+            buildSet {
+                while (cursor.moveToNext()) add(cursor.getString(1))
+            }
+        }
+        assertTrue("opportunity_revision" in attemptColumns)
+        assertEquals(OpenMeshDeliveryDatabase.DATABASE_VERSION, database.version)
         database.close()
     }
 

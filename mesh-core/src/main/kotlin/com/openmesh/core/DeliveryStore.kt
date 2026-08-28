@@ -174,10 +174,40 @@ data class TransferContext(
     val adapterId: String,
     /** Opaque local reference only; this does not define the Opportunity model. */
     val opportunityId: String,
+    /** Null means the exact opportunity revision was not recorded by legacy code. */
+    val opportunityRevision: Long? = null,
 ) {
     init {
         requireBoundedStoreText("Adapter reference", adapterId, 256)
         requireBoundedStoreText("Opportunity reference", opportunityId, 256)
+        require(opportunityRevision == null || opportunityRevision > 0) {
+            "Opportunity revision must be positive when recorded"
+        }
+    }
+
+    /** Reconstructs an exact SPI reference only when every revisioned fact is valid. */
+    fun exactOpportunityReferenceOrNull(): TransportOpportunityReference? {
+        val revision = opportunityRevision ?: return null
+        return try {
+            TransportOpportunityReference(
+                key = TransportOpportunityKey(
+                    adapterId = TransportAdapterId(adapterId),
+                    opportunityId = TransportOpportunityId(opportunityId),
+                ),
+                revision = TransportOpportunityRevision(revision),
+            )
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
+    companion object {
+        fun forOpportunity(reference: TransportOpportunityReference): TransferContext =
+            TransferContext(
+                adapterId = reference.adapterId.value,
+                opportunityId = reference.opportunityId.value,
+                opportunityRevision = reference.revision.value,
+            )
     }
 }
 

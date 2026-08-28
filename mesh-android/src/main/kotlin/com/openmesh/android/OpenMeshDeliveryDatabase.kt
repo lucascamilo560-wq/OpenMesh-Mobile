@@ -23,6 +23,16 @@ internal class OpenMeshDeliveryDatabase(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion == 1 && newVersion == 2) {
+            db.execSQL(
+                """
+                ALTER TABLE ${DeliverySchema.TRANSFER_ATTEMPTS}
+                ADD COLUMN opportunity_revision INTEGER
+                    CHECK(opportunity_revision IS NULL OR opportunity_revision > 0)
+                """.trimIndent(),
+            )
+            return
+        }
         error("No OpenMesh delivery database upgrade exists from $oldVersion to $newVersion")
     }
 
@@ -31,7 +41,7 @@ internal class OpenMeshDeliveryDatabase(
     }
 
     companion object {
-        private const val DATABASE_VERSION = 1
+        internal const val DATABASE_VERSION = 2
 
         private val SCHEMA = listOf(
             """
@@ -73,6 +83,8 @@ internal class OpenMeshDeliveryDatabase(
                     REFERENCES ${DeliverySchema.DELIVERY_RECORDS}(delivery_id) ON DELETE CASCADE,
                 adapter_id TEXT NOT NULL,
                 opportunity_id TEXT NOT NULL,
+                opportunity_revision INTEGER
+                    CHECK(opportunity_revision IS NULL OR opportunity_revision > 0),
                 state TEXT NOT NULL,
                 reserved_at_ms INTEGER NOT NULL,
                 lease_expires_at_ms INTEGER NOT NULL,
