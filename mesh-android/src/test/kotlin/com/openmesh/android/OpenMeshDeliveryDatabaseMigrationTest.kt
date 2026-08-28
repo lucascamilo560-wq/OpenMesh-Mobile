@@ -136,6 +136,7 @@ class OpenMeshDeliveryDatabaseMigrationTest {
             },
         )
         runCatching { store.close() }
+        Unit
     }
 
     private fun createRealisticV1Database(name: String): LegacyAttemptRow {
@@ -145,7 +146,7 @@ class OpenMeshDeliveryDatabaseMigrationTest {
         V1_SCHEMA.forEach(database::execSQL)
         database.execSQL(
             "INSERT INTO store_metadata (key, long_value) VALUES (?, ?)",
-            arrayOf("next_attempt_sequence", 2L),
+            arrayOf<Any>("next_attempt_sequence", 2L),
         )
         database.insertOrThrow(
             "delivery_records",
