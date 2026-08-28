@@ -364,6 +364,147 @@ class PersistentTransportDecisionExecutorTest {
     }
 
     @Test
+    fun `cancellation during completed-local settlement preserves link write`() = runBlocking {
+        val backing = waitingStore("executor-cancel-link-settlement")
+        val tracking = TrackingDeliveryStore(backing)
+        val entered = CompletableDeferred<Unit>()
+        val interrupted = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var settlementCalls = 0
+        tracking.beforeLinkWrite = {
+            settlementCalls += 1
+            if (settlementCalls == 1) {
+                entered.complete(Unit)
+                try {
+                    release.await()
+                } finally {
+                    interrupted.complete(Unit)
+                }
+            }
+        }
+        val execution = async(start = CoroutineStart.UNDISPATCHED) {
+            executor(tracking, RecordingAdapter()).execute(
+                DeliveryId("executor-cancel-link-settlement"),
+                transferDecision(),
+            )
+        }
+        entered.await()
+        val cancellation = CancellationException("cancel during link settlement")
+        execution.cancel(cancellation)
+        interrupted.await()
+        release.complete(Unit)
+
+        val thrown = expectSuspendThrows<CancellationException> { execution.await() }
+        val attempt = backing.snapshot(DeliveryId("executor-cancel-link-settlement"))
+            .transferAttempts.single()
+
+        assertEquals(cancellation.message, thrown.message)
+        assertEquals(2, settlementCalls)
+        assertEquals(TransferAttemptState.LINK_WRITE_COMPLETED, attempt.state)
+        assertNull(attempt.failureReason)
+    }
+
+    @Test
+    fun `cancellation during local-failure settlement preserves original failure`() = runBlocking {
+        val backing = waitingStore("executor-cancel-failure-settlement")
+        val tracking = TrackingDeliveryStore(backing)
+        val entered = CompletableDeferred<Unit>()
+        val interrupted = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var settlementCalls = 0
+        tracking.beforeFailure = { _ ->
+            settlementCalls += 1
+            if (settlementCalls == 1) {
+                entered.complete(Unit)
+                try {
+                    release.await()
+                } finally {
+                    interrupted.complete(Unit)
+                }
+            }
+        }
+        val adapter = RecordingAdapter { request ->
+            TransportTransferResult.FailedLocally(
+                transferId = request.transferId,
+                occurredAtMs = 150,
+                failure = TransportLocalFailure(TransportLocalFailureCode.IO_ERROR),
+            )
+        }
+        val execution = async(start = CoroutineStart.UNDISPATCHED) {
+            executor(tracking, adapter).execute(
+                DeliveryId("executor-cancel-failure-settlement"),
+                transferDecision(),
+            )
+        }
+        entered.await()
+        val cancellation = CancellationException("cancel during failure settlement")
+        execution.cancel(cancellation)
+        interrupted.await()
+        release.complete(Unit)
+
+        val thrown = expectSuspendThrows<CancellationException> { execution.await() }
+        val attempt = backing.snapshot(DeliveryId("executor-cancel-failure-settlement"))
+            .transferAttempts.single()
+
+        assertEquals(cancellation.message, thrown.message)
+        assertEquals(2, settlementCalls)
+        assertEquals(TransferAttemptState.FAILED, attempt.state)
+        assertEquals(
+            PersistentTransportFailureReason.TRANSPORT_LOCAL_IO_ERROR.name,
+            attempt.failureReason,
+        )
+    }
+
+    @Test
+    fun `cancellation remains primary when non-cancellable settlement also fails`() = runBlocking {
+        val backing = waitingStore("executor-cancel-settlement-fails")
+        val tracking = TrackingDeliveryStore(backing)
+        val entered = CompletableDeferred<Unit>()
+        val interrupted = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val settlementFailure = SimulatedFailure("non-cancellable settlement failed")
+        var settlementCalls = 0
+        tracking.beforeLinkWrite = {
+            settlementCalls += 1
+            when (settlementCalls) {
+                1 -> {
+                    entered.complete(Unit)
+                    try {
+                        release.await()
+                    } finally {
+                        interrupted.complete(Unit)
+                    }
+                }
+
+                else -> throw settlementFailure
+            }
+        }
+        val execution = async(start = CoroutineStart.UNDISPATCHED) {
+            executor(tracking, RecordingAdapter()).execute(
+                DeliveryId("executor-cancel-settlement-fails"),
+                transferDecision(),
+            )
+        }
+        entered.await()
+        val cancellation = CancellationException("cancel and fail settlement")
+        execution.cancel(cancellation)
+        interrupted.await()
+        release.complete(Unit)
+
+        val thrown = expectSuspendThrows<CancellationException> { execution.await() }
+        val suppressed = thrown.suppressed.single {
+            it is TransportExecutionSettlementException
+        } as TransportExecutionSettlementException
+        val attempt = backing.snapshot(DeliveryId("executor-cancel-settlement-fails"))
+            .transferAttempts.single()
+
+        assertEquals(cancellation.message, thrown.message)
+        assertSame(settlementFailure, suppressed.cause)
+        assertSame(PersistentLocalTransportOutcome.CompletedLocally, suppressed.localOutcome)
+        assertEquals(TransferAttemptState.TRANSFERRING, attempt.state)
+    }
+
+    @Test
     fun `execution deadline settles failed before lease expiry`() = runBlocking {
         val store = waitingStore("executor-deadline")
         val entered = CompletableDeferred<Unit>()
@@ -646,6 +787,8 @@ class PersistentTransportDecisionExecutorTest {
             private set
         var failStart: Boolean = false
         var failLinkWrite: Boolean = false
+        var beforeLinkWrite: suspend () -> Unit = {}
+        var beforeFailure: suspend (String) -> Unit = {}
 
         override suspend fun reserveTransfer(
             reservation: TransferReservation,
@@ -672,6 +815,7 @@ class PersistentTransportDecisionExecutorTest {
         ): TransferAttempt {
             mutationCalls += 1
             operations += "link-write"
+            beforeLinkWrite()
             if (failLinkWrite) throw SimulatedFailure("link-write commit failed")
             return delegate.recordLinkWriteCompleted(lease, nowMs)
         }
@@ -683,6 +827,7 @@ class PersistentTransportDecisionExecutorTest {
         ): TransferAttempt {
             mutationCalls += 1
             operations += "failure"
+            beforeFailure(reason)
             return delegate.recordTransferFailure(lease, reason, nowMs)
         }
 
