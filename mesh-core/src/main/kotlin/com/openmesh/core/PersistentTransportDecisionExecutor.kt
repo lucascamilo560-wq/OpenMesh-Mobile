@@ -314,6 +314,9 @@ class PersistentTransportDecisionExecutor(
                     reason = PersistentTransportFailureReason.ADAPTER_EXCEPTION,
                     outcome = outcome,
                 )
+            } catch (cancelled: CancellationException) {
+                cancelled.addSuppressed(failure)
+                throw cancelled
             } catch (settlementFailure: Throwable) {
                 settlementFailure.addSuppressed(failure)
                 throw settlementFailure
@@ -406,22 +409,41 @@ class PersistentTransportDecisionExecutor(
     private suspend fun settleLinkWrite(
         lease: TransferLease,
         outcome: PersistentLocalTransportOutcome,
-    ): TransferAttempt = try {
+    ): TransferAttempt = settlePreservingCancellation(lease, outcome) {
         deliveryStore.recordLinkWriteCompleted(lease, nowMs())
-    } catch (failure: Throwable) {
-        throw TransportExecutionSettlementException(lease.attemptId, outcome, failure)
     }
 
     private suspend fun settleFailure(
         lease: TransferLease,
         reason: PersistentTransportFailureReason,
         outcome: PersistentLocalTransportOutcome,
-    ): TransferAttempt = try {
+    ): TransferAttempt = settlePreservingCancellation(lease, outcome) {
         deliveryStore.recordTransferFailure(
             lease = lease,
             reason = reason.name,
             nowMs = nowMs(),
         )
+    }
+
+    private suspend fun settlePreservingCancellation(
+        lease: TransferLease,
+        outcome: PersistentLocalTransportOutcome,
+        settlement: suspend () -> TransferAttempt,
+    ): TransferAttempt = try {
+        settlement()
+    } catch (cancelled: CancellationException) {
+        try {
+            withContext(NonCancellable) { settlement() }
+        } catch (settlementFailure: Throwable) {
+            cancelled.addSuppressed(
+                TransportExecutionSettlementException(
+                    attemptId = lease.attemptId,
+                    localOutcome = outcome,
+                    cause = settlementFailure,
+                ),
+            )
+        }
+        throw cancelled
     } catch (failure: Throwable) {
         throw TransportExecutionSettlementException(lease.attemptId, outcome, failure)
     }
