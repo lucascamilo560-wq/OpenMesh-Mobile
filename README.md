@@ -1,8 +1,14 @@
 # OpenMesh Mobile
 
-Offline-first, delay-tolerant mobile mesh networking for Android.
+Open-source, offline-first, delay-tolerant mobile mesh networking for Android.
 
-OpenMesh Mobile is an independent project designed to let nearby smartphones discover each other, exchange packets without Internet access, store messages while a route is unavailable, and forward them later when another node is encountered.
+OpenMesh Mobile is an independent project building reusable infrastructure for nearby smartphones to discover each other, exchange packets without Internet access, store messages while a route is unavailable, and forward them later when another node is encountered. The project is intended for environments where connectivity is unavailable, intermittent, expensive, or operationally constrained.
+
+## Project status
+
+OpenMesh Mobile is under active development and should currently be considered pre-1.0 infrastructure. Core routing, persistence, BLE transport, peer verification and end-to-end cryptographic primitives are implemented, while additional transport and trust-layer work remains in progress. Public APIs and protocol details may still evolve as interoperability and resilience testing expands.
+
+Contributions, protocol review, test cases and reproducible bug reports are welcome.
 
 ## Current architecture
 
@@ -69,6 +75,21 @@ Use the committed wrapper so local and CI builds run the same Gradle distributio
 
 Relay nodes do not need plaintext access to E2E application payloads. Encryption and signatures are protocol-level concerns. A discovered public key must hash to the resolved self-certifying `nodeId` and successfully sign a fresh challenge before the Android SDK persists it as a verified peer key. Human/contact-level trust remains a separate application concern; proximity alone does not establish identity ownership.
 
+Security-sensitive changes should preserve these trust boundaries and include focused tests for cryptographic, routing and persistence behavior.
+
+## Contributing
+
+Issues and pull requests are welcome. For substantial protocol or architecture changes, open an issue first so the design, compatibility impact and security assumptions can be discussed before implementation.
+
+Useful contributions include:
+
+- reproducible bug reports and regression tests;
+- BLE interoperability testing across Android devices;
+- routing, persistence and failure-recovery tests;
+- protocol and cryptographic review;
+- Wi-Fi Direct / Wi-Fi Aware transport work;
+- documentation and integration examples.
+
 ## License
 
-No license has been granted yet. All rights reserved until a license is explicitly added.
+OpenMesh Mobile is licensed under the [Apache License 2.0](LICENSE).
